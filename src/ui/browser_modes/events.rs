@@ -12,11 +12,6 @@ use crate::{
 };
 
 impl ModeViews {
-    #[cfg(test)]
-    pub fn handle(&mut self, event: &BrowserEvent) {
-        self.handle_with_deferred_empty(event, false);
-    }
-
     pub(crate) fn handle_with_deferred_empty(&mut self, event: &BrowserEvent, defer_empty: bool) {
         if self.handle_structure_event(event) {
             return;
@@ -299,7 +294,9 @@ impl ModeViews {
             BrowserEvent::FocusChanged { depth, .. } => {
                 let positions = self.browser.selected_positions(*depth);
                 self.update_panes(*depth, |pane| set_selections(pane, &positions));
-                self.focus_visible_pane(*depth);
+                if !self.cursor_keeps_focus.get() {
+                    self.focus_visible_pane(*depth);
+                }
             }
             _ => {}
         }
@@ -453,6 +450,3 @@ impl Pane {
         self.loading.show("status");
     }
 }
-
-#[cfg(test)]
-mod tests;

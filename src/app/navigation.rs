@@ -51,6 +51,7 @@ pub struct ColumnState {
     selection_anchor: Option<Location>,
     selection_target: Option<Location>,
     pending_selection: HashSet<Location>,
+    pending_reveal: Option<Location>,
     pub load_state: LoadState,
     pub truncated: bool,
     /// Whether entries here can be moved to Trash, resolved from a listed entry
@@ -104,6 +105,29 @@ pub struct NavigationState {
     preferences: ViewPreferences,
     // GTK focus/rebuild selection echoes must not arm paste-into.
     selection_commit: bool,
+    selectionless_removals: HashSet<Location>,
+    visual: Option<VisualRange>,
+}
+
+/// A walked range over one pane in displayed order. The fill is recomputed from
+/// `base` on every cursor move, so contracting the range restores what it covered.
+pub struct VisualRange {
+    depth: usize,
+    directory: Location,
+    anchor: Location,
+    kind: VisualKind,
+    base: HashSet<Location>,
+    // Space inside the range flips an item on top of the walked result.
+    toggled: HashSet<Location>,
+    // A Shift+arrow run: walked like `Select`, but not a visual mode, so it has no
+    // footer tag and ends at the next key that is not part of the run.
+    extend: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisualKind {
+    Select,
+    Unset,
 }
 
 impl NavigationState {
@@ -131,6 +155,7 @@ impl NavigationState {
 
         self.record_navigation();
         self.peek = None;
+        self.visual = None;
         self.selection_commit = false;
         self.columns.truncate(parent_depth + 1);
         self.push_column(location, request_id);
@@ -178,6 +203,7 @@ impl NavigationState {
         request_ids: impl IntoIterator<Item = RequestId>,
     ) {
         self.peek = None;
+        self.visual = None;
         self.selection_commit = false;
         let preferences = self.preferences;
         self.columns = path
@@ -195,6 +221,7 @@ impl NavigationState {
                 selection_anchor: None,
                 selection_target: None,
                 pending_selection: HashSet::new(),
+                pending_reveal: None,
                 load_state: LoadState::Loading,
                 truncated: false,
                 can_trash: None,
@@ -269,6 +296,7 @@ impl NavigationState {
             selection_anchor: None,
             selection_target: None,
             pending_selection: HashSet::new(),
+            pending_reveal: None,
             load_state: LoadState::Loading,
             truncated: false,
             can_trash: None,
@@ -283,6 +311,50 @@ impl NavigationState {
         if let Some(column) = self.columns.get_mut(depth) {
             column.select_first_on_load = true;
         }
+    }
+
+    pub fn select_location_on_load(&mut self, depth: usize, location: Location) {
+        if let Some(column) = self.columns.get_mut(depth) {
+            column.selected = None;
+            column.selected_locations.clear();
+            column.selection_anchor = None;
+            column.selection_target = None;
+            column.pending_selection.clear();
+            column.pending_reveal = Some(location);
+            column.select_first_on_load = false;
+            column.load_cursor = None;
+        }
+    }
+
+    pub fn take_resolved_location_reveal(
+        &mut self,
+        depth: usize,
+        request_id: RequestId,
+    ) -> Option<bool> {
+        let column = self.columns.get_mut(depth)?;
+        if column.request_id != request_id {
+            return None;
+        }
+        let target = column.pending_reveal.as_ref()?;
+        let is_hidden = column
+            .entries
+            .iter()
+            .find(|entry| &entry.location == target)?
+            .is_hidden;
+        column.pending_reveal = None;
+        Some(is_hidden)
+    }
+
+    pub fn take_unresolved_location_reveal(
+        &mut self,
+        depth: usize,
+        request_id: RequestId,
+    ) -> Option<Location> {
+        let column = self.columns.get_mut(depth)?;
+        if column.request_id != request_id {
+            return None;
+        }
+        column.pending_reveal.take()
     }
 
     pub fn apply_batch(
@@ -311,6 +383,7 @@ impl NavigationState {
                 column.selection_target = None;
             }
         }
+        column.resolve_pending_reveal();
         column.restore_pending_selection();
         if column.select_first_on_load && !column.entries.is_empty() {
             column.pending_selection.clear();
@@ -349,6 +422,7 @@ impl NavigationState {
                 column.selection_target = None;
             }
         }
+        column.resolve_pending_reveal();
         column.restore_pending_selection();
         if column.select_first_on_load && !column.entries.is_empty() {
             column.pending_selection.clear();
@@ -457,16 +531,34 @@ impl NavigationState {
         Some((depth, positions, stale))
     }
 
+    pub fn set_selectionless_removals(&mut self, locations: impl IntoIterator<Item = Location>) {
+        self.selectionless_removals = locations.into_iter().collect();
+    }
+
+    pub fn retain_selectionless_removals(&mut self, locations: impl IntoIterator<Item = Location>) {
+        let locations: HashSet<_> = locations.into_iter().collect();
+        self.selectionless_removals
+            .retain(|location| locations.contains(location));
+    }
+
     pub fn apply_directory_change(
         &mut self,
         depth: usize,
         watched: &Location,
         change: DirectoryChange,
     ) -> Option<(Vec<EntrySplice>, Option<usize>)> {
-        let column = self
+        if !self
             .columns
-            .get_mut(depth)
-            .filter(|column| &column.location == watched)?;
+            .get(depth)
+            .is_some_and(|column| &column.location == watched)
+        {
+            return None;
+        }
+        let replace_selection = match &change {
+            DirectoryChange::Remove(location) => !self.selectionless_removals.remove(location),
+            _ => true,
+        };
+        let column = self.columns.get_mut(depth).expect("column checked");
         let preferences = column.preferences;
         let mut selected_location = column
             .selected
@@ -494,7 +586,7 @@ impl NavigationState {
                 let selected_was_removed = selected_location.as_ref() == Some(&location);
                 column.selected_locations.remove(&location);
                 remove_monitored_entry(&mut column.entries, &location, &mut splices);
-                if selected_was_removed {
+                if selected_was_removed && replace_selection {
                     selected_location = removed_position.and_then(|position| {
                         column
                             .entries
@@ -608,6 +700,7 @@ impl NavigationState {
             &mut column.selection_target,
             &mut column.selection_anchor,
             &mut column.load_cursor,
+            &mut column.pending_reveal,
         ] {
             *target = target
                 .as_ref()
@@ -759,6 +852,7 @@ impl NavigationState {
 
     pub fn fail(&mut self, request_id: RequestId, message: String) -> Option<usize> {
         let (depth, column) = self.column_for_request_mut(request_id)?;
+        column.pending_reveal = None;
         column.load_state = LoadState::Error(message);
         Some(depth)
     }
@@ -822,7 +916,267 @@ impl NavigationState {
         column.selected = Some(position);
         column.selection_anchor = Some(location);
         self.active_column = Some(depth);
+        self.visual = None;
         true
+    }
+
+    /// A load cursor is not a fill: the first Space adds that item.
+    pub fn toggle_cursor_fill(&mut self) -> CursorToggle {
+        let Some(depth) = self
+            .active_column
+            .or_else(|| self.columns.len().checked_sub(1))
+        else {
+            return CursorToggle::Empty;
+        };
+        let Some(column) = self.columns.get_mut(depth) else {
+            return CursorToggle::Empty;
+        };
+        let visible = visible_positions(column);
+        let Some(position) = column
+            .selected
+            .filter(|position| visible.contains(position))
+        else {
+            return CursorToggle::Empty;
+        };
+        let location = column.entries[position].location.clone();
+        let filled = column.load_cursor.is_none() && column.selected_locations.contains(&location);
+        if column.load_cursor.is_some() {
+            column.selected_locations.clear();
+            column.load_cursor = None;
+            column.pending_reveal = None;
+        }
+        if filled {
+            column.selected_locations.remove(&location);
+            CursorToggle::Removed
+        } else {
+            column.selected_locations.insert(location);
+            CursorToggle::Added
+        }
+    }
+
+    pub fn select_visible(&mut self, depth: usize) -> Option<(usize, Vec<usize>)> {
+        self.replace_visible(depth, true)
+    }
+
+    pub fn invert_visible(&mut self, depth: usize) -> Option<(usize, Vec<usize>)> {
+        self.replace_visible(depth, false)
+    }
+
+    fn replace_visible(&mut self, depth: usize, select_all: bool) -> Option<(usize, Vec<usize>)> {
+        self.visual = None;
+        let column = self.columns.get_mut(depth)?;
+        let visible = visible_positions(column);
+        if visible.is_empty() {
+            return None;
+        }
+        let focused = column
+            .selected
+            .filter(|position| visible.contains(position))
+            .unwrap_or(visible[0]);
+        let committed = column.load_cursor.is_none();
+        let locations = visible
+            .iter()
+            .filter_map(|position| {
+                let location = &column.entries[*position].location;
+                let selected = committed && column.selected_locations.contains(location);
+                (select_all || !selected).then(|| location.clone())
+            })
+            .collect();
+        adopt_selected_locations(column, locations, true);
+        column.selected = Some(focused);
+        self.active_column = Some(depth);
+        let positions = selected_position_list(column);
+        Some((focused, positions))
+    }
+
+    pub fn install_pane_fill(&mut self, depth: usize, positions: &[usize], cursor: usize) -> bool {
+        let Some(column) = self.columns.get_mut(depth) else {
+            return false;
+        };
+        if cursor >= column.entries.len()
+            || positions
+                .iter()
+                .any(|position| *position >= column.entries.len())
+        {
+            return false;
+        }
+        let locations = positions
+            .iter()
+            .map(|position| column.entries[*position].location.clone())
+            .collect();
+        adopt_selected_locations(column, locations, true);
+        column.selected = Some(cursor);
+        self.active_column = Some(depth);
+        true
+    }
+
+    /// Leaving a load cursor drops its uncommitted highlight.
+    pub fn place_cursor(&mut self, depth: usize, position: usize) -> Option<bool> {
+        let column = self.columns.get_mut(depth)?;
+        if position >= column.entries.len() {
+            return None;
+        }
+        let cleared = place_cursor(column, position);
+        self.active_column = Some(depth);
+        Some(cleared)
+    }
+
+    /// A load cursor is not included in the range's base fill.
+    pub fn start_visual(
+        &mut self,
+        kind: VisualKind,
+        order: Option<&[usize]>,
+    ) -> Option<(usize, usize, Vec<usize>)> {
+        self.start_range(kind, false, order)
+    }
+
+    pub fn begin_extend(&mut self, order: Option<&[usize]>) -> Option<(usize, usize)> {
+        if let Some(depth) = self.live_range().map(|range| range.depth) {
+            return self.columns[depth].selected.map(|cursor| (depth, cursor));
+        }
+        self.start_range(VisualKind::Select, true, order)
+            .map(|(depth, focused, _)| (depth, focused))
+    }
+
+    pub fn end_extend(&mut self) {
+        if self.visual.as_ref().is_some_and(|range| range.extend) {
+            self.visual = None;
+        }
+    }
+
+    fn start_range(
+        &mut self,
+        kind: VisualKind,
+        extend: bool,
+        order: Option<&[usize]>,
+    ) -> Option<(usize, usize, Vec<usize>)> {
+        self.visual = None;
+        let depth = self
+            .active_column
+            .or_else(|| self.columns.len().checked_sub(1))?;
+        let column = self.columns.get_mut(depth)?;
+        let order = displayed_order(column, order);
+        let cursor = column
+            .selected
+            .filter(|position| order.contains(position))?;
+        if column.load_cursor.is_some() {
+            column.selected_locations.clear();
+            column.load_cursor = None;
+            column.pending_reveal = None;
+        }
+        self.visual = Some(VisualRange {
+            depth,
+            directory: column.location.clone(),
+            anchor: column.entries[cursor].location.clone(),
+            kind,
+            base: column.selected_locations.clone(),
+            toggled: HashSet::new(),
+            extend,
+        });
+        self.refresh_visual(Some(&order))
+    }
+
+    /// A range whose pane, anchor, or cursor disappears keeps its last fill.
+    pub fn refresh_visual(
+        &mut self,
+        order: Option<&[usize]>,
+    ) -> Option<(usize, usize, Vec<usize>)> {
+        let range = self.visual.as_ref()?;
+        let depth = range.depth;
+        let Some(column) = self
+            .columns
+            .get_mut(depth)
+            .filter(|column| column.location == range.directory)
+            .filter(|_| self.active_column == Some(depth))
+        else {
+            self.visual = None;
+            return None;
+        };
+        let order = displayed_order(column, order);
+        let index_of = |location: &Location| {
+            order
+                .iter()
+                .position(|position| &column.entries[*position].location == location)
+        };
+        let anchor = index_of(&range.anchor);
+        let cursor = column
+            .selected
+            .and_then(|cursor| order.iter().position(|position| *position == cursor));
+        let (Some(anchor), Some(cursor)) = (anchor, cursor) else {
+            self.visual = None;
+            return None;
+        };
+        let span = order[anchor.min(cursor)..=anchor.max(cursor)]
+            .iter()
+            .map(|position| &column.entries[*position].location);
+        let mut fill = range.base.clone();
+        match range.kind {
+            VisualKind::Select => fill.extend(span.cloned()),
+            VisualKind::Unset => span.for_each(|location| {
+                fill.remove(location);
+            }),
+        }
+        for location in &range.toggled {
+            if !fill.remove(location) {
+                fill.insert(location.clone());
+            }
+        }
+        adopt_selected_locations(column, fill, true);
+        let focused = order[cursor];
+        Some((depth, focused, selected_position_list(column)))
+    }
+
+    pub fn toggle_visual_cursor(
+        &mut self,
+        order: Option<&[usize]>,
+    ) -> Option<(usize, usize, Vec<usize>)> {
+        let range = self.visual.as_mut()?;
+        let location = self
+            .columns
+            .get(range.depth)
+            .and_then(|column| {
+                column
+                    .selected
+                    .and_then(|cursor| column.entries.get(cursor))
+            })
+            .map(|entry| entry.location.clone());
+        if let Some(location) = location
+            && !range.toggled.remove(&location)
+        {
+            range.toggled.insert(location);
+        }
+        self.refresh_visual(order)
+    }
+
+    pub fn take_visual(&mut self) -> Option<VisualRange> {
+        self.visual.take()
+    }
+
+    pub fn restore_visual(&mut self, range: Option<VisualRange>) {
+        self.visual = range;
+    }
+
+    pub fn leave_visual(&mut self) -> bool {
+        self.visual.take().is_some()
+    }
+
+    /// A Shift+arrow run is not a visual mode.
+    pub fn visual_kind(&self) -> Option<VisualKind> {
+        self.live_range()
+            .filter(|range| !range.extend)
+            .map(|range| range.kind)
+    }
+
+    fn live_range(&self) -> Option<&VisualRange> {
+        let range = self.visual.as_ref()?;
+        let column = self.columns.get(range.depth)?;
+        (column.location == range.directory
+            && self.active_column == Some(range.depth)
+            && column
+                .entries
+                .iter()
+                .any(|entry| entry.location == range.anchor))
+        .then_some(range)
     }
 
     pub fn commit_selection(&mut self) {
@@ -845,13 +1199,34 @@ impl NavigationState {
         {
             return false;
         }
-        let locations = positions
+        let locations: HashSet<_> = positions
             .iter()
             .map(|position| column.entries[*position].location.clone())
             .collect();
+        // Repeating the fill is a widget echo, as is a report of only the cursor
+        // while a different fill remains. After a clear, that cursor report is the
+        // click on the still-focused file, so it becomes the selection.
+        let cursor_only_outside_fill = !column.selected_locations.is_empty()
+            && column.selected.is_some_and(|cursor| {
+                column.entries.get(cursor).is_some_and(|entry| {
+                    !column.selected_locations.contains(&entry.location)
+                        && locations.len() == 1
+                        && locations.contains(&entry.location)
+                })
+            });
+        if !self.selection_commit
+            && (column.selected_locations == locations || cursor_only_outside_fill)
+            && column
+                .selected
+                .is_some_and(|cursor| cursor < column.entries.len())
+        {
+            self.active_column = Some(depth);
+            return true;
+        }
         let commit = std::mem::take(&mut self.selection_commit);
         adopt_selected_locations(column, locations, commit);
         column.selected = focused.or(column.selected);
+        self.visual = None;
         if column.selection_anchor.is_none() {
             column.selection_anchor = column
                 .selected
@@ -870,10 +1245,12 @@ impl NavigationState {
         }
         let focused = column.selected.unwrap_or(0);
         adopt_selected_locations(column, HashSet::new(), true);
+        self.visual = None;
         Some((depth, focused))
     }
 
     pub fn extend_selection(&mut self, direction: i32) -> Option<(usize, usize, Vec<usize>)> {
+        self.visual = None;
         let depth = self
             .active_column
             .or_else(|| self.columns.len().checked_sub(1))?;
@@ -950,6 +1327,7 @@ impl NavigationState {
         focused: usize,
         order: &[usize],
     ) -> Option<Vec<usize>> {
+        self.visual = None;
         let column = self.columns.get_mut(depth)?;
         let end = order.iter().position(|position| *position == focused)?;
         let start = column
@@ -1056,6 +1434,36 @@ impl NavigationState {
             .collect()
     }
 
+    /// The pane's committed fill in listing order, or its cursor item when
+    /// nothing is filled. A load cursor is not a fill, and another pane's
+    /// open-path marker is never a target.
+    pub fn command_entries(&self, depth: usize) -> Vec<FileEntry> {
+        let Some(column) = self.columns.get(depth) else {
+            return Vec::new();
+        };
+        let visible = |entry: &FileEntry| column.preferences.show_hidden || !entry.is_hidden;
+        if column.load_cursor.is_none() && !column.selected_locations.is_empty() {
+            let filled: Vec<FileEntry> = column
+                .entries
+                .iter()
+                .filter(|entry| {
+                    visible(entry) && column.selected_locations.contains(&entry.location)
+                })
+                .cloned()
+                .collect();
+            if !filled.is_empty() {
+                return filled;
+            }
+        }
+        column
+            .selected
+            .and_then(|position| column.entries.get(position))
+            .filter(|entry| visible(entry))
+            .cloned()
+            .into_iter()
+            .collect()
+    }
+
     pub fn selection_is_load_cursor(&self) -> bool {
         self.active_column
             .and_then(|depth| self.columns.get(depth))
@@ -1148,25 +1556,57 @@ impl NavigationState {
         page: usize,
         order: Option<&[usize]>,
     ) -> Option<(usize, usize)> {
+        self.shift_cursor(direction, page, order, true)
+            .map(|(depth, position, _)| (depth, position))
+    }
+
+    pub fn page_cursor(
+        &mut self,
+        direction: i32,
+        page: usize,
+        order: Option<&[usize]>,
+    ) -> Option<(usize, usize, bool)> {
+        self.shift_cursor(direction, page, order, false)
+    }
+
+    pub fn extend_page_selection(
+        &mut self,
+        direction: i32,
+        page: usize,
+        order: Option<&[usize]>,
+    ) -> Option<(usize, usize, Vec<usize>)> {
+        let (depth, visible, position) = self.page_target(direction, page, order)?;
+        let column = self.columns.get_mut(depth)?;
+        let anchored = column
+            .selection_anchor
+            .as_ref()
+            .is_some_and(|anchor| column.entries.iter().any(|entry| &entry.location == anchor));
+        if column.selected_locations.is_empty() || !anchored {
+            column.selection_anchor = column
+                .selected
+                .and_then(|cursor| column.entries.get(cursor))
+                .map(|entry| entry.location.clone());
+        }
+        let positions = self.extend_visual_selection(depth, position, &visible)?;
+        Some((depth, position, positions))
+    }
+
+    fn page_target(
+        &self,
+        direction: i32,
+        page: usize,
+        order: Option<&[usize]>,
+    ) -> Option<(usize, Vec<usize>, usize)> {
         if direction == 0 {
             return None;
         }
         let depth = self
             .active_column
             .or_else(|| self.columns.len().checked_sub(1))?;
-        let column = self.columns.get_mut(depth)?;
+        let column = self.columns.get(depth)?;
         let visible: Vec<usize> = match order {
             Some(order) if !order.is_empty() => order.to_vec(),
-            _ => {
-                let show_hidden = column.preferences.show_hidden;
-                column
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, entry)| show_hidden || !entry.is_hidden)
-                    .map(|(position, _)| position)
-                    .collect()
-            }
+            _ => visible_positions(column),
         };
         let last = visible.len().checked_sub(1)?;
         let steps = page.max(1);
@@ -1183,23 +1623,52 @@ impl NavigationState {
             (Some(current), false) => current.saturating_add(steps).min(last),
         };
         let position = visible[target];
-        focus_only(column, position);
+        Some((depth, visible, position))
+    }
+
+    fn shift_cursor(
+        &mut self,
+        direction: i32,
+        page: usize,
+        order: Option<&[usize]>,
+        replace_fill: bool,
+    ) -> Option<(usize, usize, bool)> {
+        let (depth, _, position) = self.page_target(direction, page, order)?;
+        let column = self.columns.get_mut(depth)?;
+        let cleared = if replace_fill {
+            self.visual = None;
+            focus_only(column, position);
+            false
+        } else {
+            place_cursor(column, position)
+        };
         self.active_column = Some(depth);
-        Some((depth, position))
+        Some((depth, position, cleared))
     }
 
     pub fn focus_column(&mut self, depth: usize) -> bool {
         if depth >= self.columns.len() {
             return false;
         }
-        self.active_column = Some(depth);
+        self.activate_pane(depth);
         true
+    }
+
+    fn activate_pane(&mut self, depth: usize) {
+        if self
+            .visual
+            .as_ref()
+            .is_some_and(|range| range.depth != depth)
+        {
+            self.visual = None;
+        }
+        self.active_column = Some(depth);
     }
 
     pub fn focus_parent(&mut self) -> Option<(usize, Option<usize>)> {
         let depth = self.active_column?;
         let parent_depth = depth.checked_sub(1)?;
-        self.active_column = Some(parent_depth);
+        self.activate_pane(parent_depth);
         Some((parent_depth, self.columns[parent_depth].selected))
     }
 
@@ -1222,7 +1691,7 @@ impl NavigationState {
                 column.select_first_on_load = true;
             }
         }
-        self.active_column = Some(child_depth);
+        self.activate_pane(child_depth);
         Some((child_depth, position))
     }
 
@@ -1237,6 +1706,7 @@ impl NavigationState {
         }
         self.record_navigation();
         self.peek = None;
+        self.visual = None;
         self.columns.truncate(depth);
         let parent_depth = depth - 1;
         self.active_column = Some(parent_depth);
@@ -1245,6 +1715,19 @@ impl NavigationState {
 
     pub fn entry_at(&self, depth: usize, position: usize) -> Option<FileEntry> {
         self.columns.get(depth)?.entries.get(position).cloned()
+    }
+
+    pub fn folder_names(&self, depth: usize, include_hidden: bool) -> Vec<std::ffi::OsString> {
+        let Some(column) = self.columns.get(depth) else {
+            return Vec::new();
+        };
+        let show_hidden = include_hidden || column.preferences.show_hidden;
+        column
+            .entries
+            .iter()
+            .filter(|entry| entry.is_directory() && (show_hidden || !entry.is_hidden))
+            .map(|entry| entry.native_name.clone())
+            .collect()
     }
 
     pub fn column_entry_counts(&self, depth: usize) -> Option<ColumnEntryCounts> {
@@ -1346,6 +1829,68 @@ fn focus_only(column: &mut ColumnState, position: usize) {
     column.selection_anchor = Some(location);
 }
 
+fn place_cursor(column: &mut ColumnState, position: usize) -> bool {
+    let moved = column.selected != Some(position);
+    let mut cleared = false;
+    if moved && column.load_cursor.is_some() {
+        column.selected_locations.clear();
+        column.load_cursor = None;
+        column.pending_reveal = None;
+        cleared = true;
+    }
+    column.selected = Some(position);
+    cleared
+}
+
+fn displayed_order(column: &ColumnState, order: Option<&[usize]>) -> Vec<usize> {
+    match order {
+        Some(order)
+            if !order.is_empty()
+                && order
+                    .iter()
+                    .all(|position| *position < column.entries.len()) =>
+        {
+            order.to_vec()
+        }
+        _ => visible_positions(column),
+    }
+}
+
+fn visible_positions(column: &ColumnState) -> Vec<usize> {
+    let show_hidden = column.preferences.show_hidden;
+    column
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| show_hidden || !entry.is_hidden)
+        .map(|(position, _)| position)
+        .collect()
+}
+
+fn selected_position_list(column: &ColumnState) -> Vec<usize> {
+    if column.selected_locations.is_empty() {
+        return Vec::new();
+    }
+    column
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(position, entry)| {
+            column
+                .selected_locations
+                .contains(&entry.location)
+                .then_some(position)
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorToggle {
+    Empty,
+    Added,
+    Removed,
+}
+
 impl ColumnState {
     fn invalidate_entry_indexes(&mut self) {
         self.entry_counts.set(None);
@@ -1376,6 +1921,25 @@ impl ColumnState {
         .then_some(position)
     }
 
+    fn resolve_pending_reveal(&mut self) {
+        let Some(target) = self.pending_reveal.as_ref() else {
+            return;
+        };
+        let Some(position) = self
+            .entries
+            .iter()
+            .position(|entry| &entry.location == target)
+        else {
+            return;
+        };
+        let target = target.clone();
+        self.selected = Some(position);
+        self.selected_locations = HashSet::from([target.clone()]);
+        self.selection_anchor = Some(target);
+        self.selection_target = None;
+        self.load_cursor = None;
+    }
+
     fn restore_pending_selection(&mut self) {
         if self.pending_selection.is_empty() {
             return;
@@ -1402,6 +1966,7 @@ impl ColumnState {
 fn adopt_selected_locations(column: &mut ColumnState, locations: HashSet<Location>, commit: bool) {
     if commit {
         column.load_cursor = None;
+        column.pending_reveal = None;
     }
     column.selected_locations = locations;
 }

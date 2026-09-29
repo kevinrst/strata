@@ -2,16 +2,16 @@
 
 use super::{
     BoundRow, PendingActivationKind, PendingPointerActivation, column_size_text,
-    set_active_path_style, set_cut_path_style, should_activate_single_click,
+    set_active_path_style, set_mark_path_style, should_activate_single_click,
     should_preview_pointer_press,
 };
 use crate::ui::{
     browser::{
         ViewState,
         clipboard::{
-            PreparedFileDrop, drag_actions_for_modifiers, drag_icon_with_count, file_drag_content,
-            file_drop_action, file_drop_commit, locations_equal, locations_from_file_list_value,
-            prepare_file_drop_target, shared_cut_locations,
+            ClipboardMark, PreparedFileDrop, clipboard_mark, drag_actions_for_modifiers,
+            drag_icon_with_count, file_drag_content, file_drop_action, file_drop_commit,
+            locations_from_file_list_value, prepare_file_drop_target,
         },
         collection::{ViewMap, activate_recursive_search_result, cancel_source},
         entry::{
@@ -229,6 +229,7 @@ pub(super) fn column_rows(
                     row.add_css_class("dragging");
                 }
                 if let Some(state) = weak_state_for_begin.upgrade() {
+                    state.drag_source_depth.set(Some(depth));
                     state.cancel_peek();
                 }
             });
@@ -266,18 +267,43 @@ pub(super) fn column_rows(
             let highlighted_row = row.downgrade();
             let state_for_enter = drop_state.clone();
             drop.connect_enter(move |target, _, _| {
+                let action = file_drop_action(target, &state_for_enter);
                 if let Some(row) = highlighted_row.upgrade() {
-                    row.add_css_class("drop-destination");
+                    if action.is_empty() {
+                        row.remove_css_class("drop-destination");
+                    } else {
+                        row.add_css_class("drop-destination");
+                    }
                 }
-                file_drop_action(target, &state_for_enter)
+                action
             });
             let highlighted_row = row.downgrade();
             let state_for_motion = drop_state.clone();
             drop.connect_motion(move |target, _, _| {
+                let action = file_drop_action(target, &state_for_motion);
                 if let Some(row) = highlighted_row.upgrade() {
-                    row.add_css_class("drop-destination");
+                    if action.is_empty() {
+                        row.remove_css_class("drop-destination");
+                    } else {
+                        row.add_css_class("drop-destination");
+                    }
                 }
-                file_drop_action(target, &state_for_motion)
+                action
+            });
+            let highlighted_row = row.downgrade();
+            let state_for_value = drop_state.clone();
+            drop.connect_value_notify(move |target| {
+                if target.current_drop().is_none() {
+                    return;
+                }
+                let action = file_drop_action(target, &state_for_value);
+                if let Some(row) = highlighted_row.upgrade() {
+                    if action.is_empty() {
+                        row.remove_css_class("drop-destination");
+                    } else {
+                        row.add_css_class("drop-destination");
+                    }
+                }
             });
             let highlighted_row = row.downgrade();
             drop.connect_leave(move |_| {
@@ -363,6 +389,7 @@ pub(super) fn column_rows(
         let rename_position = Rc::new(Cell::new(None::<usize>));
         let rename_position_for_press = rename_position.clone();
         let rename_position_for_release = rename_position.clone();
+        let name_label_for_press = label.downgrade();
         selection_click.connect_pressed(move |gesture, press_count, x, y| {
             pending_activation_for_press.take();
             rename_position_for_press.set(None);
@@ -407,10 +434,18 @@ pub(super) fn column_rows(
             if !shift && let Some(anchor) = change.anchor {
                 anchor_at(&weak_state_for_click, depth, &map_for_click, anchor);
             }
+            // Own this write for the whole synchronous selection-changed emission.
+            // A click on the cursor row is otherwise identical to a focus echo.
+            let pointer_owner = weak_state_for_click
+                .upgrade()
+                .inspect(|state| state.pointer_owns_selection.set(true));
             selection_for_click.set_selection(
                 &change.selected,
                 &gtk::Bitset::new_range(0, selection_for_click.n_items()),
             );
+            if let Some(state) = pointer_owner {
+                state.pointer_owns_selection.set(false);
+            }
             if (control || shift)
                 && let Some(widget) = gesture.widget()
                 && crate::ui::pointer::hits_item_content(&widget, x, y)
@@ -492,7 +527,7 @@ pub(super) fn column_rows(
                         control,
                         shift,
                         preserve_group,
-                    );
+                    ) && !state.browser.is_open_child(depth, &entry.location);
                     let slow_click_rename = press_count == 1
                         && selected_before
                         && selected_count_before == 1
@@ -506,7 +541,13 @@ pub(super) fn column_rows(
                         && !preserve_group
                         && !activate
                         && !state.browser.is_chooser_mode()
-                        && !is_trash_location(&entry.location);
+                        && !is_trash_location(&entry.location)
+                        && gesture
+                            .widget()
+                            .zip(name_label_for_press.upgrade())
+                            .is_some_and(|(row, label)| {
+                                crate::ui::pointer::hits_name_label(&row, label.upcast_ref(), x, y)
+                            });
                     rename_position_for_press.set(if slow_click_rename {
                         Some(source_position)
                     } else {
@@ -773,6 +814,13 @@ pub(super) fn column_rows(
         } else {
             label.set_opacity(1.0);
         }
+        crate::ui::browser::find::highlight_name(
+            label.upcast_ref(),
+            state
+                .as_ref()
+                .and_then(|state| state.find_highlight())
+                .as_deref(),
+        );
         let origin = entry
             .as_ref()
             .filter(|_| searching)
@@ -788,14 +836,14 @@ pub(super) fn column_rows(
                 .as_ref()
                 .is_some_and(|browser| browser.is_open_child(depth, &entry.location))
         });
-        set_active_path_style(&row, active);
-        set_cut_path_style(
+        let immediate =
+            browser.as_ref().and_then(|browser| browser.active_depth()) == Some(depth + 1);
+        set_active_path_style(&row, active, immediate);
+        set_mark_path_style(
             &row,
-            entry.as_ref().is_some_and(|entry| {
-                shared_cut_locations()
-                    .iter()
-                    .any(|cut| locations_equal(cut, &entry.location))
-            }),
+            entry
+                .as_ref()
+                .map_or(ClipboardMark::None, |entry| clipboard_mark(&entry.location)),
         );
         if let Some(entry) = entry.as_ref() {
             let mode_active = state
@@ -842,7 +890,7 @@ pub(super) fn column_rows(
         } else {
             crate::ui::thumbnail::show_fallback_icon(&icon, crate::assets::icons::DOCUMENTS, 17);
             icon.set_hidden(false);
-            icon.set_cut(false);
+            icon.set_mark(ClipboardMark::None);
             icon.set_base_opacity(0.72);
             chevron.set_visible(false);
         }

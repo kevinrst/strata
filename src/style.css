@@ -1094,6 +1094,15 @@ headerbar menubutton.header-action > button:focus-visible {
   padding: 10px 12px;
 }
 
+.send-to-success {
+  background: @theme_surface;
+  border: 1px solid alpha(@theme_border, 0.6);
+  border-radius: 8px;
+  box-shadow: 0 2px 10px alpha(@theme_bg, 0.4);
+  margin: 12px;
+  padding: 10px 12px;
+}
+
 .form-message.warning {
   background: alpha(@theme_accent, 0.1);
   border: 1px solid alpha(@theme_accent, 0.46);
@@ -1104,6 +1113,47 @@ headerbar menubutton.header-action > button:focus-visible {
   color: @theme_accent;
   min-height: 18px;
   min-width: 18px;
+}
+
+.transfer-progress-dialog .action-dialog {
+  min-width: 600px;
+}
+
+.transfer-progress-dialog .action-dialog-body {
+  padding: 24px 28px;
+}
+
+.transfer-pending-warning {
+  padding: 12px 16px;
+  background: @theme_surface;
+  color: @theme_danger;
+  border: 1px solid @theme_danger;
+  border-radius: 10px;
+}
+
+.transfer-progress-caption {
+  color: @theme_dim_text;
+  font-size: 0.76em;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.transfer-progress-bytes {
+  color: @theme_text;
+  font-size: 1.12em;
+  font-weight: 600;
+}
+
+.transfer-progress-percent {
+  color: @theme_accent;
+  font-size: 1.85em;
+  font-weight: 700;
+}
+
+.transfer-progress-footer {
+  color: @theme_dim_text;
+  font-size: 0.82em;
 }
 
 .modal-progress trough {
@@ -1230,6 +1280,54 @@ entry.form-control:disabled {
   background: alpha(@theme_muted, 0.3);
   border-color: alpha(@theme_border, 0.38);
   color: @theme_dim_text;
+}
+
+.destination-location-bar {
+  background: alpha(@theme_bg, 0.72);
+  border: 1px solid alpha(@theme_border, 0.54);
+  border-radius: 5px;
+  box-shadow: none;
+  min-height: 34px;
+  padding: 3px 9px;
+}
+
+.destination-location-bar:hover {
+  border-color: alpha(@theme_accent, 0.68);
+}
+
+.destination-location-bar:focus-within {
+  border-color: @theme_accent;
+  box-shadow: 0 0 0 1px alpha(@theme_accent, 0.42);
+  outline: 2px solid @theme_accent;
+  outline-offset: -2px;
+}
+
+.destination-location-bar.error,
+.destination-location-bar.error:hover,
+.destination-location-bar.error:focus-within {
+  border-color: @theme_danger;
+  box-shadow: 0 0 0 1px alpha(@theme_danger, 0.4);
+  outline: 2px solid @theme_danger;
+  outline-offset: -2px;
+}
+
+.destination-location-bar entry,
+.destination-location-bar entry:hover,
+.destination-location-bar entry:focus,
+.destination-location-bar entry:focus-visible,
+.destination-location-bar entry:focus-within,
+.destination-location-bar entry.error,
+.destination-location-bar entry.error:hover,
+.destination-location-bar entry.error:focus,
+.destination-location-bar entry.error:focus-visible,
+.destination-location-bar entry.error:focus-within {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  min-height: 0;
+  outline: none;
+  padding: 0;
 }
 
 dropdown.form-control > button,
@@ -2107,6 +2205,21 @@ paned > separator {
   padding: 0 6px 0 12px;
 }
 
+/* 10xer: the drawer, not the listing, receives keys. Matches the Miller
+   column's three-pixel destination bar without shifting the header. */
+.preview-pane.preview-keyboard-owner .preview-header {
+  box-shadow: inset 0 3px 0 @theme_accent;
+}
+
+.preview-content:focus-visible {
+  outline: none;
+}
+
+/* The header bar above already marks the drawer that owns the keys. */
+.preview-pane.preview-keyboard-owner :focus-visible {
+  outline: none;
+}
+
 .preview-title {
   color: @theme_text;
   font-weight: 700;
@@ -2830,9 +2943,60 @@ entry.preview-command-entry selection {
   font-size: 0.85em;
 }
 
-.shortcut-footer-count {
+.shortcut-footer-count,
+.tenxer-experimental,
+.shortcut-footer-chord,
+.shortcut-footer-feedback {
   color: @theme_text;
   font-weight: normal;
+}
+
+.sidebar-keycap {
+  color: @theme_text;
+  background-color: @theme_bg;
+  border: 1px solid @theme_border;
+  border-radius: 4px;
+  padding: 0 5px;
+  font-size: 0.85em;
+  font-weight: bold;
+}
+
+.shortcut-footer-chord-hint {
+  color: @theme_dim_text;
+  font-weight: normal;
+}
+
+.shortcut-footer-prompt-label {
+  color: @theme_accent;
+  font-weight: bold;
+}
+
+/* Fits the shared entry style into the footer row so opening a prompt never
+   resizes the footer. */
+entry.form-control.shortcut-footer-prompt {
+  min-height: 20px;
+  padding: 0 6px;
+}
+
+/* The prompt is the only thing in the footer while open; its caret marks focus. */
+entry.form-control.shortcut-footer-prompt:focus,
+entry.form-control.shortcut-footer-prompt:focus-visible,
+entry.form-control.shortcut-footer-prompt:focus-within {
+  border-color: alpha(@theme_border, 0.54);
+  box-shadow: none;
+  outline: none;
+}
+
+.tenxer-tag,
+.shortcut-footer-chord-pill {
+  color: @theme_accent;
+  background-color: alpha(@theme_accent, 0.14);
+  border: 1px solid alpha(@theme_accent, 0.4);
+  border-radius: 999px;
+  margin: 2px 0;
+  padding: 0 8px;
+  font-weight: bold;
+  letter-spacing: 0.5px;
 }
 
 .shortcut-footer-paste {
@@ -2845,8 +3009,7 @@ entry.preview-command-entry selection {
   font-weight: bold;
 }
 
-.shortcut-footer-button > button,
-.shortcut-reference-close {
+.shortcut-footer-button > button {
   background: transparent;
   color: @theme_text;
   border: 1px solid transparent;
@@ -2857,29 +3020,25 @@ entry.preview-command-entry selection {
   padding: 0 6px;
 }
 
-.shortcut-footer-button > button:hover,
-.shortcut-reference-close:hover {
+.shortcut-footer-button > button:hover {
   background: @theme_highlight;
   color: @theme_text;
   border-color: @theme_border;
 }
 
 .shortcut-footer-button > button:active,
-.shortcut-footer-button > button:checked,
-.shortcut-reference-close:active {
+.shortcut-footer-button > button:checked {
   background: @theme_highlight;
   color: @theme_text;
   border-color: @theme_accent;
 }
 
-.shortcut-footer-button > button:focus-visible,
-.shortcut-reference-close:focus-visible {
+.shortcut-footer-button > button:focus-visible {
   outline: 2px solid @theme_accent;
   outline-offset: -2px;
 }
 
-.shortcut-footer-button > button:disabled,
-.shortcut-reference-close:disabled {
+.shortcut-footer-button > button:disabled {
   color: @theme_dim_text;
   background: @theme_surface;
 }
@@ -2887,15 +3046,115 @@ entry.preview-command-entry selection {
 .shortcut-popover > contents {
   background: @theme_surface;
   color: @theme_text;
-  border: 1px solid @theme_border;
-  border-radius: 8px;
-  padding: 14px;
-  box-shadow: 0 4px 16px alpha(@theme_bg, 0.4);
+  border: 1px solid alpha(@theme_border, 0.6);
+  border-radius: 9px;
+  padding: 0;
+  box-shadow: 0 0 14px alpha(@theme_glow, 0.24);
+}
+
+.shortcut-chord-popover > contents {
+  padding: 8px;
+}
+
+.shortcut-reference-header,
+.shortcut-reference-footer {
+  padding: 14px 20px;
+}
+
+.shortcut-reference-header {
+  border-bottom: 1px solid @theme_border;
+}
+
+.shortcut-reference-footer {
+  border-top: 1px solid @theme_border;
 }
 
 .shortcut-reference-title {
   color: @theme_text;
   font-weight: 600;
+}
+
+.shortcut-reference-sidebar {
+  min-width: 225px;
+  border-right: 1px solid @theme_border;
+}
+
+.shortcut-reference-categories {
+  padding: 12px 0;
+}
+
+.shortcut-reference-body.compact .shortcut-reference-categories {
+  padding: 10px 12px;
+}
+
+.shortcut-reference-body.compact .shortcut-reference-sidebar {
+  min-width: 0;
+  border-right: 0;
+  border-bottom: 1px solid @theme_border;
+}
+
+.shortcut-reference-body.compact .shortcut-reference-results {
+  padding: 12px 16px;
+}
+
+.shortcut-reference-category {
+  background: transparent;
+  color: @theme_dim_text;
+  border: 0;
+  border-left: 3px solid transparent;
+  border-radius: 0;
+  padding: 9px 18px;
+}
+
+.shortcut-reference-category:hover {
+  background: alpha(@theme_accent, 0.1);
+  color: @theme_text;
+}
+
+.shortcut-reference-category:focus,
+.shortcut-reference-category:focus-visible {
+  outline: 2px solid @theme_accent;
+  outline-offset: -2px;
+}
+
+.shortcut-reference-category.selected {
+  background: alpha(@theme_accent, 0.16);
+  color: @theme_text;
+  border-left: 3px solid @theme_accent;
+}
+
+.shortcut-reference-body.compact .shortcut-reference-category {
+  border: 1px solid alpha(@theme_border, 0.4);
+  border-radius: 14px;
+  min-height: 22px;
+  padding: 0 9px;
+}
+
+.shortcut-reference-body.compact .shortcut-reference-category.selected {
+  background: alpha(@theme_accent, 0.2);
+  border-color: @theme_accent;
+}
+
+.shortcut-reference-body.compact .shortcut-reference-category:focus,
+.shortcut-reference-body.compact .shortcut-reference-category:focus-visible {
+  border-color: @theme_accent;
+  box-shadow: 0 0 0 1px @theme_accent;
+  outline: none;
+}
+
+.shortcut-reference-search {
+  min-width: 150px;
+}
+
+.shortcut-reference-results separator {
+  background: @theme_accent;
+  border: 0;
+  padding: 0;
+  min-height: 1px;
+}
+
+.shortcut-reference-results {
+  padding: 20px 24px;
 }
 
 .shortcut-reference-heading {
@@ -2905,22 +3164,36 @@ entry.preview-command-entry selection {
 
 .shortcut-reference-key {
   color: @theme_text;
-  font-weight: 600;
+  background: alpha(@theme_text, 0.06);
+  border: 1px solid @theme_border;
+  border-radius: 5px;
+  padding: 2px 6px;
   font-size: 0.9em;
 }
 
-.shortcut-reference-description,
-.shortcut-reference-note {
+.shortcut-reference-description {
   color: @theme_text;
 }
 
-.shortcut-reference-note {
+.shortcut-reference-note,
+.shortcut-reference-count {
+  color: @theme_dim_text;
   font-size: 0.9em;
 }
 
+.shortcut-popover scrolledwindow:focus,
 .shortcut-popover scrolledwindow:focus-visible {
-  outline: 2px solid @theme_accent;
-  outline-offset: -2px;
+  outline: none;
+}
+
+.shortcut-reference-scroll:focus,
+.shortcut-reference-scroll:focus-visible {
+  background: alpha(@theme_accent, 0.06);
+}
+
+.shortcut-popover.tenxer-active scrolledwindow:focus,
+.shortcut-popover.tenxer-active scrolledwindow:focus-visible {
+  outline: none;
 }
 
 .columns {
@@ -3252,7 +3525,7 @@ menubutton.column-header-action > button:active {
   background: @theme_surface;
   border: 1px solid alpha(@theme_border, 0.55);
   border-radius: 9px;
-  box-shadow: 0 0 14px alpha(@theme_accent, 0.16), 0 8px 24px alpha(@theme_shadow, 0.32);
+  box-shadow: 0 0 14px alpha(@theme_glow, 0.16), 0 8px 24px alpha(@theme_shadow, 0.32);
   padding: 4px;
 }
 
@@ -3353,6 +3626,11 @@ menubutton.column-header-action > button:active {
 
 .properties-row-value {
   color: @theme_text;
+}
+
+.properties-row-value selection {
+  color: @theme_bg;
+  background: @theme_accent;
 }
 
 .properties-size-value {
@@ -4267,9 +4545,18 @@ textview > popover.menu button.model:focus-visible,
 }
 
 .file-list row:hover:not(:selected),
-.file-list row:hover .file-row.active-path,
 .file-list-mode row:hover:not(:selected) {
   background: alpha(@theme_accent, 0.15);
+  color: @theme_text;
+}
+
+.file-list row:hover .file-row.active-path {
+  background: alpha(@theme_accent, 0.16);
+  color: @theme_text;
+}
+
+.file-list row:hover .file-row.active-path.active-parent {
+  background: alpha(@theme_accent, 0.35);
   color: @theme_text;
 }
 
@@ -4393,7 +4680,12 @@ textview > popover.menu button.model:focus-visible,
 
 .directory-column:not(:focus-within) .file-list:not(.context-selection) row:selected,
 .file-list-mode:not(:focus-within):not(.context-selection) row:selected {
-  background: alpha(@theme_highlight, 0.55);
+  background: alpha(@theme_accent, 0.08);
+  color: @theme_text;
+}
+
+.directory-column:not(:focus-within) .file-list row:selected .file-row.active-parent {
+  background: alpha(@theme_accent, 0.20);
   color: @theme_text;
 }
 
@@ -4411,7 +4703,7 @@ textview > popover.menu button.model:focus-visible,
 
 .keyboard-navigation .directory-column:not(:focus-within) .file-list:not(.context-selection) row:selected:hover,
 .keyboard-navigation .file-list-mode:not(:focus-within):not(.context-selection) row:selected:hover {
-  background: alpha(@theme_highlight, 0.55);
+  background: alpha(@theme_accent, 0.08);
 }
 
 .keyboard-navigation .file-list row:hover:not(:selected),
@@ -4435,12 +4727,50 @@ textview > popover.menu button.model:focus-visible,
   border-radius: 4px;
 }
 
+@keyframes active-path-pulse {
+  0% {
+    background: alpha(@theme_accent, 0.52);
+  }
+  35% {
+    background: alpha(@theme_accent, 0.38);
+  }
+  100% {
+    background: alpha(@theme_accent, 0.28);
+  }
+}
+
+.file-list .file-row.flash-active-path {
+  animation: active-path-pulse 420ms ease-out;
+}
+
 .file-list .file-row.active-path {
+  background: alpha(@theme_accent, 0.08);
+  color: @theme_text;
+}
+
+.file-list .file-row.active-path.active-parent {
+  background: alpha(@theme_accent, 0.28);
+  color: @theme_text;
+}
+
+.file-list row:selected .file-row.active-path {
+  background: transparent;
+}
+
+.file-list row:selected .file-row.active-path.active-parent {
+  background: alpha(@theme_accent, 0.20);
   color: @theme_text;
 }
 
 .file-list .file-row.active-path .file-chevron {
   color: @theme_dim_text;
+  opacity: 0.45;
+}
+
+.file-list .file-row.active-path.active-parent .file-chevron,
+.file-list row:selected .file-chevron {
+  color: @theme_accent;
+  opacity: 1;
 }
 
 .loading-skeleton {

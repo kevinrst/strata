@@ -10,6 +10,7 @@ mod install_source;
 pub(crate) mod jobs;
 mod listeners;
 mod mime_type;
+pub(crate) mod model_preview;
 mod native_fs;
 mod navigation_history;
 mod operations;
@@ -31,6 +32,7 @@ pub(crate) use document::{
     DocumentSpanStyle, DocumentTableCellLayout, DocumentUnit, DocumentUnitKind, document_kind,
     has_web_scheme, layout_document, parse_document, parse_markdown,
 };
+pub(crate) use file_source::sanitize_failure_message;
 pub use file_source::{
     DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
     LocationValidationError, MetadataOutcome, MetadataRequest, MetadataUpdate, RequestId,
@@ -49,6 +51,8 @@ pub use mime_type::{
     BROKEN_LINK_TYPE_NAME, EntryType, FOLDER_TYPE_NAME, OTHER_TYPE_NAME, entry_type,
     entry_type_description, mime_description_for_name,
 };
+pub(crate) use model_preview::ModelRender;
+pub use model_preview::{ModelFormat, ModelPalette};
 pub(crate) use native_fs::{is_hidden_name, native_hidden_names, native_kind};
 pub(crate) use navigation_history::NavigationHistory;
 pub use operations::{
@@ -59,13 +63,13 @@ pub use operations::{
     UndoMergeRequest, UndoMoveItem, UndoMoveRequest, UndoRenameRequest, validate_basename,
 };
 pub use preview::{
-    ArchiveDirectory, ArchiveFileEntry, ArchiveNode, ArchivePreviewTree, MediaPreviewSize, Preview,
-    PreviewContent, PreviewEvent, PreviewProvider, PreviewRequest, PreviewRequestId,
-    SandboxedMedia, SecretString, archive_preview_tree,
+    ArchiveDirectory, ArchiveFileEntry, ArchiveNode, ArchivePreviewTree, MediaPreviewSize,
+    ModelPreviewStage, PdfTextLayer, Preview, PreviewContent, PreviewEvent, PreviewProvider,
+    PreviewRequest, PreviewRequestId, SandboxedMedia, SecretString, archive_preview_tree,
 };
 pub(crate) use preview::{
     INCORRECT_ARCHIVE_PASSWORD, archive_preview_format, content_family, has_plain_text_extension,
-    is_extensionless_dotfile, is_image_path, is_media_path,
+    is_extensionless_dotfile, is_image_path, is_media_path, is_model,
     is_non_executable_extensionless_dotfile, normalize_preview_text, split_archive_name,
     supports_remote_video,
 };

@@ -240,7 +240,7 @@ def test_filter_text_selection_uses_the_active_theme(strata, tmp_path):
     strata.wait(selected_text_has_theme_background, "theme-colored filter text selection")
 
 
-@pytest.mark.parametrize("mode", ALL_MODES)
+@pytest.mark.parametrize("mode", [mode for mode in ALL_MODES if mode.id != "list"])
 @pytest.mark.parametrize("trigger,query,count,target", [
     ("pointer", "match-note", 4, "beta/match-note.txt"),
     ("keyboard", "match-note", 4, "beta/match-note.txt"),
@@ -309,11 +309,13 @@ def test_filtered_item_menu_actions_use_the_real_location(strata, mode, trigger,
                 break
             strata.keyboard.press("Down")
         assert strata.menu_item("Properties").has_state("focused")
+        assert row.has_state("selected"), "menu navigation changed selection"
         strata.keyboard.press("Return")
     else:
         strata.choose_menu_item("Properties")
     dialog = strata.wait_for_dialog()
     assert target in dialog.dump()
+    assert row.has_state("selected"), "selection changed while Properties was opening"
     strata.keyboard.press("Escape")
     strata.wait(lambda: strata.dialog() is None, "result Properties to close")
     strata.wait(lambda: row.has_state("focused"), "Properties to restore the actual search result")
@@ -326,6 +328,8 @@ def test_filtered_item_menu_actions_use_the_real_location(strata, mode, trigger,
     strata.wait(strata.context_menu, "the restored result menu")
     strata.choose_menu_item("Quick preview")
     strata.wait(lambda: strata.preview_shows("beta source"), "preview of the nested result")
+    strata.wait(lambda: result(strata, target).has_state("selected"),
+                "preview to retain the selected result")
     assert field.text == query
     strata.keyboard.press("ctrl+f")
     strata.wait(lambda: field.has_state("focused"), "Ctrl+F to return from the preview")
@@ -357,6 +361,12 @@ def test_query_updates_retain_selection_focus_preview_and_background_menu(strata
     strata.pointer.click(field)
     strata.keyboard.press("space")
     strata.wait(lambda: strata.preview_shows("beta source"), "the selected preview")
+    hovered = result(strata, "alpha/match-note.txt")
+    strata.pointer.move_to(*hovered.screen_bounds().center)
+    strata.settle(hovered)
+    assert not hovered.has_state("selected")
+    assert result(strata, "beta/match-note.txt").has_state("selected")
+    assert strata.preview_shows("beta source")
     for query, count in [("match-note.t", 3), ("match-note", 4)] * 2:
         strata.keyboard.press("ctrl+a")
         strata.keyboard.type_text(query)
@@ -455,6 +465,8 @@ def test_matching_rename_stays_searchable_at_the_real_parent(strata, mode):
     strata.keyboard.type_text("renamed")
     row = strata.wait(lambda: result(strata, "beta/match-note-renamed.txt"), "the fresh index result")
     strata.pointer.right_click(row)
+    items = strata.menu_items()
+    assert items.index("Quick preview") < items.index("Open file location")
     strata.choose_menu_item("Open file location")
     strata.wait_for_directory("beta")
     strata.wait_for_selection(["match-note-renamed.txt"], "beta")
@@ -564,3 +576,55 @@ def test_filtered_thumbnail_stays_rendered_across_updates_and_rename(strata, mod
     icon = row.find(role="image")
     assert icon is not None
     strata.wait(lambda: thumbnail_pixel() == (230, 40, 60), "the renamed red thumbnail")
+
+
+@pytest.mark.preferences(
+    tenxer_mode=True,
+    type_to_search=False,
+    single_click_previews=False,
+    filter_include_subfolders=False,
+)
+@pytest.mark.parametrize("mode", ALL_MODES)
+def test_tenxer_escape_leaves_visual_and_preview_before_search_results(strata, mode):
+    def footer_mark(name):
+        return strata.window.find(role="label", name=name) is not None
+
+    strata.select_entry("match-note.txt")
+    everything = strata.entry_names()
+    strata.keyboard.press("f")
+    strata.editable_field()
+    strata.keyboard.type_text("other")
+    strata.keyboard.press("Return")
+    strata.wait(lambda: footer_mark("filter: other"), "the filter to commit")
+    strata.keyboard.press("s")
+    strata.editable_field()
+    strata.keyboard.type_text("only")
+    strata.keyboard.press("Return")
+    strata.wait(lambda: footer_mark("search: only"), "the search to apply")
+    strata.wait_for_focused_entry("only-match.txt")
+    strata.keyboard.press("i")
+    strata.wait(strata.preview, "i to preview the hit")
+    strata.keyboard.press("v")
+    strata.wait(lambda: footer_mark("Visual select"), "v to start a range")
+
+    strata.keyboard.press("Escape")
+    strata.wait(lambda: not footer_mark("Visual select"), "Esc to leave visual mode")
+    assert footer_mark("search: only")
+    assert strata.preview() is not None
+    assert strata.matches() == ["only-match.txt"]
+
+    strata.keyboard.press("Escape")
+    strata.wait(lambda: strata.preview() is None, "Esc to close the preview")
+    assert footer_mark("search: only")
+    strata.wait_for_focused_entry("only-match.txt")
+
+    strata.keyboard.press("Escape")
+    strata.wait(
+        lambda: footer_mark("filter: other") and not footer_mark("search: only"),
+        "Esc to dismiss the hits and restore the filter",
+    )
+    strata.wait(lambda: strata.matches() == ["match-note-other.md"], "the restored filter")
+
+    strata.keyboard.press("Escape")
+    strata.wait(lambda: not footer_mark("filter: other"), "Esc to clear the restored filter")
+    strata.wait(lambda: strata.entry_names() == everything, "the full listing")

@@ -46,6 +46,13 @@ mod sidebar;
 mod unlock_argument;
 mod volume_password;
 
+pub(super) use devices::{
+    RemovableDestination, removable_destinations, resolve_removable_destination,
+};
+pub(in crate::ui) use keyboard::{
+    SidebarChord, activate_sidebar_focus, move_sidebar_focus, sidebar_chord,
+};
+
 pub use open_argument::present_open;
 pub use unlock_argument::{UnlockTarget, present_unlock};
 
@@ -125,7 +132,7 @@ pub(super) enum TypeToSearchQuery {
 
 impl TypeToSearch {
     fn show(&self, query: TypeToSearchQuery) -> bool {
-        self.preferences.type_to_search()
+        self.preferences.type_to_search_active()
             && match query {
                 TypeToSearchQuery::Empty => self.view.show_filter(),
                 TypeToSearchQuery::Character(character) => {
@@ -556,6 +563,23 @@ const DEFAULT_ACCELS: &[(&str, &[&str])] = &[
     ("win.toggle-arrow-scope", &["<Primary>backslash"]),
 ];
 
+const TENXER_SUPPRESSED_ACCELS: &[&str] = &[
+    "win.jump-folder",
+    "win.open-terminal",
+    "win.toggle-arrow-scope",
+];
+
+pub(super) fn install_mode_accelerators(application: &gtk::Application, tenxer: bool) {
+    for (action, accels) in DEFAULT_ACCELS {
+        let accels = if tenxer && TENXER_SUPPRESSED_ACCELS.contains(action) {
+            &[][..]
+        } else {
+            *accels
+        };
+        application.set_accels_for_action(action, accels);
+    }
+}
+
 fn is_refresh_shortcut(key: gtk::gdk::Key) -> bool {
     key == gtk::gdk::Key::F5
 }
@@ -773,9 +797,13 @@ pub(super) fn build_appearance_menu(
     let (row, check, _) = appearance_row(
         crate::assets::icons::EYE,
         "Preview panel",
-        "Space",
+        "",
         preview.is_enabled(),
     );
+    let preview_shortcut = gtk::Label::new(None);
+    preview_shortcut.add_css_class("folder-context-shortcut");
+    row.append(&preview_shortcut);
+    row.reorder_child_after(&check, Some(&preview_shortcut));
     let preview_toggle = gtk::ToggleButton::builder()
         .child(&row)
         .has_frame(false)
@@ -783,7 +811,25 @@ pub(super) fn build_appearance_menu(
     preview_toggle.add_css_class("appearance-option");
     preview_toggle.add_css_class("preview-panel-option");
     super::accessibility::set_label(&preview_toggle, "Preview panel");
-    preview_toggle.set_tooltip_text(Some("Toggle preview panel while browsing (Space)"));
+    let shortcut_label = preview_shortcut.clone();
+    let tooltip_toggle = preview_toggle.clone();
+    preferences.bind_preference(
+        &preview_shortcut,
+        PreferenceManager::tenxer_mode,
+        move |_, enabled| {
+            let text = crate::ui::shortcut_reference::context_hint_for(
+                crate::ui::shortcut_reference::ContextHint::Preview,
+                enabled,
+            );
+            shortcut_label.set_text(text);
+            shortcut_label.set_visible(!text.is_empty());
+            tooltip_toggle.set_tooltip_text(Some(&if text.is_empty() {
+                "Toggle preview panel while browsing".to_owned()
+            } else {
+                format!("Toggle preview panel while browsing ({text})")
+            }));
+        },
+    );
     let actions = gio::SimpleActionGroup::new();
     actions.add_action(&preview.action());
     preview_toggle.insert_action_group("preview", Some(&actions));
@@ -1029,6 +1075,9 @@ pub(super) struct SidebarState {
     pub(in crate::ui) rail: Cell<bool>,
     pub(in crate::ui) saved_width: Cell<Option<i32>>,
     update_label: gtk::Label,
+    keycaps: RefCell<Vec<gtk::Label>>,
+    keycaps_shown: Cell<bool>,
+    visible_pins: RefCell<Vec<Location>>,
 }
 
 /// Rows of the Trash sidebar context menu that only make sense while Trash holds items.
@@ -1185,6 +1234,8 @@ impl SidebarState {
             self.widget.remove(&child);
         }
         self.place_rows.borrow_mut().clear();
+        self.keycaps.borrow_mut().clear();
+        self.visible_pins.borrow_mut().clear();
 
         self.append_static_places();
         self.append_devices();
@@ -1279,6 +1330,7 @@ impl SidebarState {
                 row.set_tooltip_text(Some(&location.display_path()));
             }
         }
+        self.sync_keycaps();
     }
 }
 
@@ -1291,6 +1343,9 @@ fn sync_sidebar_button(button: &gtk::Button, rail: bool) {
         while let Some(widget) = child {
             child = widget.next_sibling();
             if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                if label.has_css_class("sidebar-keycap") {
+                    continue;
+                }
                 if rail {
                     button.set_tooltip_text(Some(label.label().as_str()));
                 }
@@ -1386,6 +1441,7 @@ impl SidebarState {
                 }
                 let location = Location::local(home_directory());
                 let row = self.append_place(crate::assets::icons::HOME, "Home", location.clone());
+                self.add_keycap(&row, "h");
                 if !self.local_only {
                     self.attach_place_context_menu(&row, location, |state| {
                         state.preference_manager.set_sidebar_show_home(false);
@@ -1405,6 +1461,7 @@ impl SidebarState {
                 let location = Location::uri("network:///");
                 let row =
                     self.append_place(crate::assets::icons::NETWORK, "Network", location.clone());
+                self.add_keycap(&row, "n");
                 self.attach_place_context_menu(&row, location, |state| {
                     state.preference_manager.set_sidebar_show_network(false);
                 });
@@ -1434,10 +1491,13 @@ impl SidebarState {
             && let Some(path) = glib::user_special_dir(directory)
                 .filter(|path| should_show_standard_place(place, path, &home_directory()))
         {
-            if self.local_only {
-                self.append_place(icon, name, Location::local(path));
+            let row = if self.local_only {
+                self.append_place(icon, name, Location::local(path))
             } else {
-                self.append_reorderable_place(place, icon, name, Location::local(path));
+                self.append_reorderable_place(place, icon, name, Location::local(path))
+            };
+            if let Some(key) = standard_place_chord_key(place) {
+                self.add_keycap(&row, key);
             }
         }
     }
@@ -1457,12 +1517,17 @@ impl SidebarState {
                 self.append_separator();
             }
             self.append_heading("PINNED");
-            for (index, location, name) in pinned {
-                if self.local_only {
+            for (ordinal, (index, location, name)) in pinned.into_iter().enumerate() {
+                self.visible_pins.borrow_mut().push(location.clone());
+                let row = if self.local_only {
                     let row = self.append_place(crate::assets::icons::FOLDER, &name, location);
                     row.add_css_class("sidebar-pinned-row");
+                    row
                 } else {
-                    self.append_pinned_place(index, &name, location);
+                    self.append_pinned_place(index, &name, location)
+                };
+                if let Some(key) = PIN_CHORD_KEYS.get(ordinal) {
+                    self.add_keycap(&row, key);
                 }
             }
         }
@@ -1659,6 +1724,11 @@ impl SidebarState {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn places_for_test(&self) -> gtk::Box {
+        self.widget.clone()
+    }
+
     pub(super) fn focus_active_place(&self) -> bool {
         let rows = self.place_rows.borrow();
         rows.iter()
@@ -1736,6 +1806,7 @@ impl SidebarState {
         let location = Location::uri("recent:///");
         let row = sidebar_button(crate::assets::icons::CLOCK, "Recent");
         row.set_tooltip_text(Some("recent:///"));
+        self.add_keycap(&row, "r");
         self.bind_place_row(&row, location, PlaceNavigation::Direct);
         self.make_place_reorderable(&row, "recent");
         self.widget.append(&row);
@@ -1745,6 +1816,7 @@ impl SidebarState {
         let location = Location::uri("trash:///");
         let row = sidebar_button(crate::assets::icons::TRASH, "Trash");
         row.set_tooltip_text(Some("trash:///"));
+        self.add_keycap(&row, "t");
         self.bind_place_row(&row, location, PlaceNavigation::Direct);
 
         let menu = super::accessibility::menu_box();
@@ -1881,7 +1953,7 @@ impl SidebarState {
         icon: &str,
         name: &str,
         location: Location,
-    ) {
+    ) -> gtk::Button {
         let row = sidebar_button(icon, name);
         row.set_tooltip_text(Some(&location.display_path()));
         self.bind_place_row(&row, location.clone(), PlaceNavigation::Direct);
@@ -1899,6 +1971,7 @@ impl SidebarState {
 
         self.make_place_reorderable(&row, id);
         self.widget.append(&row);
+        row
     }
 
     fn make_place_reorderable(self: &Rc<Self>, row: &gtk::Button, id: &'static str) {
@@ -2196,7 +2269,12 @@ impl SidebarState {
         row.add_controller(context);
     }
 
-    fn append_pinned_place(self: &Rc<Self>, index: usize, name: &str, location: Location) {
+    fn append_pinned_place(
+        self: &Rc<Self>,
+        index: usize,
+        name: &str,
+        location: Location,
+    ) -> gtk::Button {
         let row = self.append_place(crate::assets::icons::FOLDER, name, location.clone());
         row.add_css_class("sidebar-pinned-row");
         self.make_pinned_row_reorderable(&row, index);
@@ -2204,6 +2282,36 @@ impl SidebarState {
         self.attach_place_context_menu(&row, location, move |state| {
             state.unpin_location(&unpinned_location);
         });
+        row
+    }
+
+    /// Keycaps name the second key of the **g** place chord while it is armed.
+    fn add_keycap(&self, row: &gtk::Button, key: &str) {
+        let Some(content) = row.child().and_downcast::<gtk::Box>() else {
+            return;
+        };
+        let keycap = gtk::Label::new(Some(key));
+        keycap.add_css_class("sidebar-keycap");
+        keycap.set_visible(self.keycaps_shown.get() && !self.rail.get());
+        content.append(&keycap);
+        self.keycaps.borrow_mut().push(keycap);
+    }
+
+    pub(in crate::ui) fn show_place_keycaps(&self, shown: bool) {
+        self.keycaps_shown.set(shown);
+        self.sync_keycaps();
+    }
+
+    fn sync_keycaps(&self) {
+        let visible = self.keycaps_shown.get() && !self.rail.get();
+        for keycap in self.keycaps.borrow().iter() {
+            keycap.set_visible(visible);
+        }
+    }
+
+    /// Pinned places in sidebar display order, excluding rows the sidebar hides.
+    pub(in crate::ui) fn visible_pins(&self) -> Vec<Location> {
+        self.visible_pins.borrow().clone()
     }
 
     fn attach_place_context_menu(
@@ -2634,11 +2742,11 @@ fn release_kind(action: MediaRelease) -> device_release::ReleaseKind {
     }
 }
 
-fn drive_can_unplug(drive: &gio::Drive) -> bool {
+pub(super) fn drive_can_unplug(drive: &gio::Drive) -> bool {
     drive.is_removable() || drive.is_media_removable() || drive.can_eject()
 }
 
-fn mount_can_unplug(mount: &gio::Mount) -> bool {
+pub(super) fn mount_can_unplug(mount: &gio::Mount) -> bool {
     if mount.can_eject() {
         return true;
     }
@@ -2648,7 +2756,7 @@ fn mount_can_unplug(mount: &gio::Mount) -> bool {
         .is_some_and(|drive| drive_can_unplug(&drive))
 }
 
-fn volume_can_unplug(volume: &gio::Volume) -> bool {
+pub(super) fn volume_can_unplug(volume: &gio::Volume) -> bool {
     if volume.can_eject() {
         return true;
     }
@@ -2877,28 +2985,6 @@ fn crypto_password_uuid_for_mount(mount: &gio::Mount) -> Option<String> {
         .map(devices::probe_block_crypto)
         .unwrap_or_default();
     devices::crypto_password_uuid(None, unix.as_deref(), hint.as_ref(), false)
-}
-
-#[cfg(test)]
-fn request_encrypted_lock(
-    parent: &gtk::Widget,
-    volume_name: &str,
-    luks_uuid: Option<String>,
-    mount: Option<gio::Mount>,
-    drive: Option<gio::Drive>,
-    browser: &Rc<Browser>,
-    in_flight: &Rc<Cell<bool>>,
-) {
-    request_encrypted_lock_showing(
-        parent,
-        volume_name,
-        luks_uuid,
-        mount,
-        drive,
-        browser,
-        None,
-        in_flight,
-    );
 }
 
 #[expect(
@@ -3396,6 +3482,18 @@ fn resolve_place_order(persisted: &[String]) -> Vec<&'static str> {
         order.insert(position, id);
     }
     order
+}
+
+const PIN_CHORD_KEYS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+fn standard_place_chord_key(id: &str) -> Option<&'static str> {
+    match id {
+        "documents" => Some("k"),
+        "downloads" => Some("d"),
+        "pictures" => Some("p"),
+        "videos" => Some("v"),
+        _ => None,
+    }
 }
 
 fn standard_place(id: &str) -> Option<(&'static str, &'static str, glib::UserDirectory)> {

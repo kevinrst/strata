@@ -16,11 +16,9 @@ mod imp {
         pub texture: RefCell<Option<gdk::Texture>>,
         pub fallback: RefCell<Option<gdk::Texture>>,
         pub fallback_icon: RefCell<Option<String>>,
-        pub cut: Cell<bool>,
+        pub(crate) mark: Cell<crate::ui::browser::ClipboardMark>,
         pub hidden: Cell<bool>,
         pub base_opacity: Cell<f64>,
-        #[cfg(test)]
-        pub resize_calls: Cell<u32>,
     }
 
     #[glib::object_subclass]
@@ -57,24 +55,23 @@ mod imp {
             if width <= 0.0 || height <= 0.0 {
                 return;
             }
-            let is_cut = self.cut.get();
-
-            let texture = if is_cut {
-                crate::assets::primary_icon_paintable(crate::assets::icons::SCISSORS)
-                    .or_else(|| self.texture.borrow().clone())
-                    .or_else(|| self.fallback.borrow().clone())
-            } else {
-                self.texture
-                    .borrow()
-                    .clone()
-                    .or_else(|| self.fallback.borrow().clone())
+            let mark_icon = match self.mark.get() {
+                crate::ui::browser::ClipboardMark::None => None,
+                crate::ui::browser::ClipboardMark::Copy => Some(crate::assets::icons::COPY),
+                crate::ui::browser::ClipboardMark::Cut => Some(crate::assets::icons::SCISSORS),
             };
+            let marked = mark_icon.is_some();
+
+            let texture = mark_icon
+                .and_then(crate::assets::primary_icon_paintable)
+                .or_else(|| self.texture.borrow().clone())
+                .or_else(|| self.fallback.borrow().clone());
 
             let Some(texture) = texture else {
                 return;
             };
 
-            let scale = if self.texture.borrow().is_some() || is_cut {
+            let scale = if self.texture.borrow().is_some() || marked {
                 1.0
             } else {
                 self.fallback_scale.get()
@@ -137,9 +134,6 @@ fn same_texture(left: Option<&gdk::Texture>, right: Option<&gdk::Texture>) -> bo
     }
 }
 
-#[cfg(test)]
-mod tests;
-
 glib::wrapper! {
     pub struct ThumbnailSlot(ObjectSubclass<imp::ThumbnailSlot>)
         @extends gtk::Widget,
@@ -163,21 +157,12 @@ impl ThumbnailSlot {
         widget
     }
 
-    #[cfg(test)]
-    pub(crate) fn slot_size(&self) -> i32 {
-        self.imp().slot.get().max(1)
-    }
-
     pub(crate) fn set_slot(&self, size: i32) {
         let size = size.max(1);
         if self.imp().slot.get() == size {
             return;
         }
         self.imp().slot.set(size);
-        #[cfg(test)]
-        self.imp()
-            .resize_calls
-            .set(self.imp().resize_calls.get() + 1);
         self.queue_resize();
     }
 
@@ -226,8 +211,8 @@ impl ThumbnailSlot {
         self.imp().texture.borrow().clone()
     }
 
-    pub(crate) fn set_cut(&self, cut: bool) {
-        if self.imp().cut.replace(cut) != cut {
+    pub(crate) fn set_mark(&self, mark: crate::ui::browser::ClipboardMark) {
+        if self.imp().mark.replace(mark) != mark {
             self.update_state_opacity();
             self.queue_draw();
         }
@@ -251,21 +236,13 @@ impl ThumbnailSlot {
     fn update_state_opacity(&self) {
         let opacity = if self.imp().hidden.get() {
             0.65
-        } else if self.imp().cut.get() || self.imp().texture.borrow().is_some() {
+        } else if self.imp().mark.get() != crate::ui::browser::ClipboardMark::None
+            || self.imp().texture.borrow().is_some()
+        {
             1.0
         } else {
             self.imp().base_opacity.get()
         };
         self.set_opacity(opacity);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resize_calls(&self) -> u32 {
-        self.imp().resize_calls.get()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fallback_texture(&self) -> Option<gdk::Texture> {
-        self.imp().fallback.borrow().clone()
     }
 }

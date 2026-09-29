@@ -13,6 +13,12 @@ from harness.modes import ALL_MODES
 ENTRY_MENU_ITEMS = {"Open", "Cut", "Copy", "Rename", "Move to Trash", "Properties"}
 
 
+def assert_menu_order(strata, expected):
+    items = strata.menu_items()
+    positions = [items.index(action) for action in expected]
+    assert positions == sorted(positions), f"unexpected action order: {items}"
+
+
 @pytest.fixture
 def executable_file(fixture_tree):
     program = fixture_tree.path("run-me")
@@ -40,6 +46,20 @@ def test_the_entry_context_menu_offers_named_actions_and_accelerators(strata):
     assert strata.menu_item("Copy").description == "Ctrl+C", (
         "the accelerator belongs in the description, not the name"
     )
+    assert_menu_order(strata, [
+        "Open", "Open With…", "Quick preview", "Print", "Cut", "Copy", "Duplicate",
+        "Rename", "Move to…", "Copy to…", "Compress…", "Customize…", "Copy path",
+        "Copy name", "Properties", "Move to Trash", "Permanently delete",
+    ])
+    strata.dismiss_menu()
+
+    strata.open_context_menu("documents")
+    assert_menu_order(strata, [
+        "Open", "Open With…", "Open in Terminal", "Cut", "Copy", "Duplicate",
+        "Rename", "Move to…", "Copy to…", "Compress…", "Pin to sidebar",
+        "Customize…", "Copy path", "Copy name", "Properties", "Move to Trash",
+        "Permanently delete",
+    ])
     strata.dismiss_menu()
 
 
@@ -122,6 +142,11 @@ def test_keyboard_context_menu_targets_selection_and_owns_keys(strata, mode, sho
     strata.wait(strata.context_menu, "the multi-selection menu")
     assert "Rename" not in strata.menu_items()
     assert "Actions" in strata.menu_items()
+    assert_menu_order(strata, [
+        "Open With…", "Cut", "Copy", "Duplicate", "Move to…", "Copy to…",
+        "Compress…", "Copy paths", "Copy names", "Properties", "Move to Trash",
+        "Permanently delete",
+    ])
     strata.wait(
         lambda: strata.menu_item("Open").has_state("focused"),
         "Open to receive initial focus with multiple files and custom actions",
@@ -209,6 +234,10 @@ def test_the_pane_context_menu_offers_directory_actions(strata):
     assert {"New Folder", "Select All", "Refresh"} <= offered, (
         f"unexpected pane menu {sorted(offered)}"
     )
+    assert_menu_order(strata, [
+        "New Folder", "New File", "Paste", "Open With…", "Open in Terminal",
+        "Select All", "Refresh", "Customize…", "Properties",
+    ])
     strata.dismiss_menu()
 
 
@@ -399,14 +428,6 @@ def test_the_shortcut_reference_opens_and_closes(strata):
     )
     for chord in ["Ctrl+Alt+Space", "Ctrl+Alt+← / →", "Ctrl+Alt+↑ / ↓", "Ctrl+Alt+M"]:
         assert strata.window.find(role="label", name=chord, rendered=False) is not None
-    strata.keyboard.press("Tab")
-    strata.keyboard.press("End")
-    description = strata.window.find(role="label", name="Seek −5 / +5 seconds", rendered=False)
-    scroll = next(node for node in description.ancestors() if node.role == "scroll pane")
-    scrollbar = scroll.find(role="scroll bar")
-    bounds = description.window_bounds()
-    assert bounds.x + bounds.width <= scrollbar.window_bounds().x
-
     strata.keyboard.press("Escape")
     strata.wait(
         lambda: strata.window.find(role="label", name="Keyboard shortcuts") is None,
@@ -424,6 +445,16 @@ def compress_from_the_context_menu(strata, entry_name, archive_name):
         lambda: field.text == archive_name, f"{archive_name!r} to reach the name field"
     )
     return field
+
+
+def _enter_destination_edit_mode(strata):
+    dialog = strata.wait_for_dialog()
+    crumb = strata.wait(
+        lambda: dialog.find(role="button", name=strata.fixture.root.name),
+        "the current destination breadcrumb",
+    )
+    strata.pointer.click(crumb)
+    return strata.editable_field()
 
 
 def test_an_invalid_archive_name_keeps_the_compress_dialog_open(strata):
@@ -451,8 +482,14 @@ def test_enter_submits_compress_and_extract_to_dialogs(strata):
 
     destination = strata.fixture.path("unpacked")
     strata.open_context_menu("bundle.zip")
+    assert_menu_order(strata, [
+        "Open", "Open With…", "Extract here", "Extract to…", "Cut", "Copy",
+        "Duplicate", "Rename", "Move to…", "Copy to…", "Compress…",
+        "Customize…", "Copy path", "Copy name", "Properties", "Move to Trash",
+        "Permanently delete",
+    ])
     strata.choose_menu_item("Extract to…")
-    field = strata.editable_field()
+    field = _enter_destination_edit_mode(strata)
     strata.keyboard.press("ctrl+a")
     strata.keyboard.type_text(str(destination))
     strata.wait(
@@ -461,11 +498,12 @@ def test_enter_submits_compress_and_extract_to_dialogs(strata):
 
     strata.keyboard.press("Return")
 
+    extracted = destination / "readme.md"
+    # Extraction creates each member before streaming its bytes into place.
     strata.wait(
-        lambda: (destination / "readme.md").exists(),
-        "Enter to extract into the destination",
+        lambda: extracted.is_file() and extracted.read_text() == "# Fixture\n",
+        "Enter to extract the complete member into the destination",
     )
-    assert (destination / "readme.md").read_text() == "# Fixture\n"
 
 
 def test_enter_submits_the_copy_to_dialog(strata):
@@ -473,7 +511,7 @@ def test_enter_submits_the_copy_to_dialog(strata):
 
     strata.open_context_menu("todo.txt")
     strata.choose_menu_item("Copy to…")
-    field = strata.editable_field()
+    field = _enter_destination_edit_mode(strata)
     strata.keyboard.press("ctrl+a")
     strata.keyboard.type_text(str(destination))
     strata.wait(

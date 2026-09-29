@@ -5,6 +5,7 @@ use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
 };
 
 use crate::model::FileEntry;
@@ -63,6 +64,7 @@ pub struct PreviewRequest {
     pub render_document: bool,
     pub pdf_page: i32,
     pub media_size: MediaPreviewSize,
+    pub model_palette: super::ModelPalette,
     pub archive_password: Option<SecretString>,
 }
 
@@ -99,7 +101,7 @@ impl PartialEq for PreviewInputLease {
 }
 impl Eq for PreviewInputLease {}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PreviewContent {
     Text {
         content: String,
@@ -121,6 +123,9 @@ pub enum PreviewContent {
     Rasterized {
         png: Vec<u8>,
     },
+    Model {
+        png: Vec<u8>,
+    },
     SandboxedMedia {
         media: SandboxedMedia,
     },
@@ -128,11 +133,22 @@ pub enum PreviewContent {
         png: Vec<u8>,
         page: i32,
         pages: i32,
+        text_layer: Option<Arc<PdfTextLayer>>,
     },
     Archive {
         tree: ArchivePreviewTree,
     },
     Unsupported,
+}
+
+/// Extracted text and per-character bounds for one rendered PDF page.
+/// `glyphs[i]` locates the i-th char of `text` in rendered PNG pixels.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PdfTextLayer {
+    pub width: f32,
+    pub height: f32,
+    pub text: String,
+    pub glyphs: Vec<[f32; 4]>,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +163,10 @@ pub(crate) const INCORRECT_ARCHIVE_PASSWORD: &str = "The password is incorrect."
 
 #[derive(Clone, Debug)]
 pub enum PreviewEvent {
+    Progress {
+        request_id: PreviewRequestId,
+        stage: ModelPreviewStage,
+    },
     Ready(Preview),
     Failed {
         request_id: PreviewRequestId,
@@ -157,6 +177,34 @@ pub enum PreviewEvent {
         request_id: PreviewRequestId,
         entry: FileEntry,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ModelPreviewStage {
+    Reading,
+    Thumbnail,
+    Rendering { triangles: usize },
+    Finishing,
+}
+
+impl ModelPreviewStage {
+    pub fn label(self) -> String {
+        match self {
+            Self::Reading => "Reading model…".into(),
+            Self::Thumbnail => "Reading thumbnail…".into(),
+            Self::Finishing => "Finishing preview…".into(),
+            Self::Rendering { triangles } => {
+                let count = if triangles >= 1_000_000 {
+                    format!("{:.1}M", triangles as f64 / 1_000_000.)
+                } else if triangles >= 1_000 {
+                    format!("{:.1}K", triangles as f64 / 1_000.)
+                } else {
+                    triangles.to_string()
+                };
+                format!("Rendering {count} triangles…")
+            }
+        }
+    }
 }
 
 pub trait PreviewProvider {
@@ -181,6 +229,10 @@ pub(crate) fn supports_remote_video(name: &OsStr) -> bool {
         .extension()
         .and_then(OsStr::to_str)
         .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "mov" | "mp4"))
+}
+
+pub(crate) fn is_model(name: &OsStr) -> bool {
+    super::ModelFormat::for_name(name).is_some()
 }
 
 pub(crate) fn has_plain_text_extension(name: &OsStr) -> bool {
@@ -216,6 +268,7 @@ pub(crate) fn content_family(content_type: &str) -> PreviewContent {
             png: Vec::new(),
             page: 0,
             pages: 0,
+            text_layer: None,
         }
     } else if content_type == "image/gif" {
         PreviewContent::Media
@@ -229,6 +282,7 @@ pub(crate) fn content_family(content_type: &str) -> PreviewContent {
             "application/json"
                 | "application/ld+json"
                 | "application/toml"
+                | "application/yaml"
                 | "application/x-yaml"
                 | "application/xml"
                 | "application/javascript"

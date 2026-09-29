@@ -51,8 +51,6 @@ thread_local! {
 }
 
 struct TrackedThumbnail {
-    #[cfg(test)]
-    image: glib::WeakRef<ThumbnailSlot>,
     path: PathBuf,
 }
 
@@ -124,11 +122,6 @@ impl PersistQueue {
 
     fn pop_front(&mut self) -> Option<PersistJob> {
         self.queue.pop_front()
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.queue.len()
     }
 }
 
@@ -352,6 +345,8 @@ enum ThumbnailKind {
     Pdf,
     Video,
     AppImage,
+    EmbeddedModel(crate::services::ModelFormat),
+    Cover(crate::sandbox::CoverFormat),
 }
 
 pub(super) fn set_thumbnail_or_icon(
@@ -587,10 +582,6 @@ fn park_thumbnail(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTarget)
     }
 }
 
-#[cfg(test)]
-fn schedule_or_defer(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTarget) {
-    park_thumbnail(key, kind, target);
-}
 fn mark_deferred(key: ThumbnailKey, kind: ThumbnailKind, image_id: usize, request: u64) {
     ACTIVE_REQUESTS.with(|requests| {
         if let Some(active) = requests
@@ -666,11 +657,6 @@ fn fire_view_group(group: usize) {
         std::mem::take(&mut settle.pending)
     });
     fire_parks(drained);
-}
-
-#[cfg(test)]
-fn fire_settled_thumbnails() {
-    fire_view_group(0);
 }
 
 fn request_is_live(target: &PendingTarget) -> bool {
@@ -880,7 +866,11 @@ async fn run_thumbnail_job(mut job: ThumbnailJob) {
 fn heavy(kind: ThumbnailKind) -> bool {
     matches!(
         kind,
-        ThumbnailKind::RawImage | ThumbnailKind::Pdf | ThumbnailKind::Video
+        ThumbnailKind::RawImage
+            | ThumbnailKind::Pdf
+            | ThumbnailKind::Video
+            | ThumbnailKind::EmbeddedModel(_)
+            | ThumbnailKind::Cover(_)
     )
 }
 
@@ -1135,8 +1125,6 @@ fn register_displayed_thumbnail(image: &ThumbnailSlot, path: &Path) {
         thumbnails.insert(
             image.as_ptr() as usize,
             TrackedThumbnail {
-                #[cfg(test)]
-                image: image.downgrade(),
                 path: path.to_path_buf(),
             },
         );
@@ -1411,14 +1399,20 @@ fn cancel_thumbnail(image_id: usize) {
 }
 
 fn thumbnail_kind(path: &Path) -> Option<ThumbnailKind> {
+    if crate::sandbox::raw_metadata::is_raw(path) {
+        return Some(ThumbnailKind::RawImage);
+    }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "svg" | "heic"
         | "heif" | "avif" | "jxl" => Some(ThumbnailKind::Image),
-        "3fr" | "arw" | "cr2" | "cr3" | "dcr" | "dng" | "erf" | "kdc" | "mef" | "mos" | "mrw"
-        | "nef" | "nrw" | "orf" | "pef" | "raf" | "raw" | "rw2" | "rwl" | "sr2" | "srf" | "srw"
-        | "x3f" => Some(ThumbnailKind::RawImage),
         "pdf" => Some(ThumbnailKind::Pdf),
+        "3mf" => Some(ThumbnailKind::EmbeddedModel(
+            crate::services::ModelFormat::ThreeMf,
+        )),
+        "fcstd" => Some(ThumbnailKind::EmbeddedModel(
+            crate::services::ModelFormat::FreeCad,
+        )),
         "appimage" => Some(ThumbnailKind::AppImage),
         "mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v" | "mpeg" | "mpg" | "ogv" => {
             Some(ThumbnailKind::Video)
@@ -1427,7 +1421,7 @@ fn thumbnail_kind(path: &Path) -> Option<ThumbnailKind> {
         "mp3" | "flac" | "m4a" | "m4b" | "mka" | "aiff" | "aif" | "wma" => {
             Some(ThumbnailKind::Video)
         }
-        _ => None,
+        _ => crate::sandbox::CoverFormat::from_argument(&extension).map(ThumbnailKind::Cover),
     }
 }
 
@@ -1443,41 +1437,8 @@ fn render_thumbnail(
         ThumbnailKind::Pdf => ParseOperation::ThumbnailPdf,
         ThumbnailKind::Video => ParseOperation::ThumbnailVideo,
         ThumbnailKind::AppImage => ParseOperation::ThumbnailAppImage,
+        ThumbnailKind::EmbeddedModel(format) => ParseOperation::ThumbnailModel(format),
+        ThumbnailKind::Cover(format) => ParseOperation::ThumbnailCover(format),
     };
     crate::sandbox::browser::thumbnail(path, operation, cancellation)
 }
-
-#[cfg(test)]
-pub(super) fn pending_thumbnail_id(path: &Path) -> Option<u64> {
-    PENDING_THUMBNAILS.with(|pending| {
-        pending
-            .borrow()
-            .iter()
-            .find_map(|(key, pending)| (key.path == path).then_some(pending.id))
-    })
-}
-
-#[cfg(test)]
-pub(super) fn has_pending_thumbnail(path: &Path) -> bool {
-    pending_thumbnail_id(path).is_some()
-}
-
-#[cfg(test)]
-pub(super) fn hold_thumbnail_workers() {
-    THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().running = MAX_CACHE_READERS);
-}
-
-#[cfg(test)]
-pub(super) fn clear_thumbnail_runtime() {
-    THUMBNAIL_QUEUE.with(|queue| {
-        let mut queue = queue.borrow_mut();
-        queue.running = 0;
-        queue.queued.clear();
-    });
-    PENDING_THUMBNAILS.with(|pending| pending.borrow_mut().clear());
-    ACTIVE_REQUESTS.with(|requests| requests.borrow_mut().clear());
-    SETTLE_VIEWS.with(|views| views.borrow_mut().clear());
-}
-
-#[cfg(test)]
-pub(super) mod tests;

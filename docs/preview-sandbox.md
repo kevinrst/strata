@@ -29,10 +29,73 @@ FHS, `/run/wrappers/bin`, `/nix/store`, or `/gnu/store`.
   cannot initiate filesystem access, network access, JavaScript execution, or
   subresource loading. Relative Markdown images are separately confined to the
   document directory and staged as bounded private files. Their decoders and the
-  native Mermaid renderer and bundled MathJax equation renderer run in sandbox
-  helpers with a three-second deadline. QuickJS has no host APIs or module loader,
+  native Mermaid renderer and bundled MathJax equation renderer run as jobs in
+  the pooled sandbox supervisors described below. QuickJS has no host APIs or module loader,
   and user equations are passed as data, not evaluated as JavaScript;
   SVG resource resolution is disabled and only validated PNG output returns.
+
+## Local 3D model previews
+
+Quick Preview accepts STL, 3MF and FreeCAD (`.FCStd`) files. STL and single-part
+3MF geometry use a fixed-angle software render; FreeCAD uses its saved image.
+A 3MF package with exactly one usable embedded PNG uses that image, even if other
+candidates are corrupt or its geometry spans multiple model parts. Two usable
+images are ambiguous: Quick Preview tries geometry, while browser thumbnailing
+leaves the normal file icon. Multipart geometry is not rendered.
+
+Browser thumbnails extract embedded images only, through the **existing browser
+worker pool** and its normal cache, cancellation and slow-job admission. There is
+no geometry fallback, new pool or thumbnail job for STL. The decoder does not read
+model XML when selecting an embedded image. Missing or unusable images leave the
+file icon, with the existing failure cache preventing immediate retries.
+
+Heavy Quick Previews (models, PDFs, workbooks and DOCX) share one process-wide
+permit and use one-shot sandboxes. Cancellation retains that permit until the
+helper exits. Format is carried explicitly across the sandbox boundary, including
+for symlinks; the UI supplies the render palette. Geometry PNG cache keys include
+format, size and palette, and open model previews reload on palette changes.
+
+Input, package and geometry limits are centralized in
+`src/services/model_preview.rs`. These are compile-time constants, not Settings
+options or environment variables:
+
+| Constant | Limit | Applies to |
+| --- | --- | --- |
+| `MAX_MODEL_INPUT_BYTES` | 128 MiB (134,217,728 bytes) | Input file, including embedded-thumbnail requests |
+| `MAX_MODEL_XML_BYTES` | 128 MiB, independently of compressed file size | Unpacked 3MF model XML |
+| `MAX_3MF_ARCHIVE_ENTRIES` | 256 | All ZIP entries in a 3MF package |
+| `MAX_FREECAD_ARCHIVE_ENTRIES` | 4096 | All ZIP entries in a FreeCAD package |
+| `MAX_3MF_OBJECTS` | 1024 | Objects in the 3MF model XML |
+| `MAX_3MF_BUILD_ITEMS` | 1024 | Build items in the 3MF model XML |
+| `MAX_3MF_COMPONENT_DEPTH` | 16 | Component nesting below a build item (depth zero) |
+| `MAX_3MF_RELATIONSHIPS_BYTES` | 64 KiB | Unpacked `_rels/.rels` in a 3MF package |
+| `MAX_MODEL_TRIANGLES` | 2 million | Parsed/emitted triangles |
+| `MAX_MODEL_VERTICES` | 2 million | 3MF vertices |
+| `MAX_MODEL_COMPONENT_REFERENCES` | 100,000 | Stored component references |
+| `MAX_MODEL_COMPONENT_EXPANSIONS` | 100,000 | Expanded objects, including pending expansion work |
+| `MAX_MODEL_RASTER_WORK` | 100 million | Triangle bounding-box pixel visits |
+
+Package entry caps are checked **before looking for an embedded thumbnail**. A
+package exceeding its entry cap is rejected even if it contains a usable PNG:
+Quick Preview reports “Model package entry limit exceeded” and the browser keeps
+the normal file icon. The `_rels/.rels` byte limit also applies before thumbnail
+selection in 3MF packages. Object, build-item and component limits apply when
+geometry is parsed, not when a usable embedded image is selected. Component
+admission checks precede expansion-stack allocation. Render output is at most
+800×800 pixels.
+
+**These input-size limits are not RAM limits.** Input, parsed geometry and codec
+allocations consume additional memory. Rendering releases source bytes first and
+projects triangles in two passes rather than retaining a second mesh. Existing
+sandbox CPU/wall-time and 2-GiB address-space limits remain a last-resort boundary;
+address space is not a resident-memory guarantee or the total application budget.
+
+Embedded-image limits live in `src/sandbox_helper/model/embedded.rs`: at most 16
+candidates, 4 MiB per candidate, 16 MiB total candidate bytes read and 16 megapixels
+(16×1024×1024 pixels) total admitted to decoding. Oversized/invalid images are not
+usable; exhausting a total inspection budget fails the operation rather than
+assuming uninspected candidates are invalid. Only bounded PNG results return to
+GTK. Thumbnail output remains at most 256×256, in the image's original colors.
 
 ## Browser worker pool
 
@@ -116,7 +179,7 @@ runs from idle after the frame, outside GTK binding/layout callbacks. Identical
 in-flight file requests are reused, and presentation refreshes do not resubmit
 them. This removes fixed scheduling waits, not the time needed for I/O or decoding.
 With more than one render slot, slow
-RAW/PDF/video work leaves capacity for ordinary images. Browser metadata admission
+RAW/PDF/video and embedded-model work leaves capacity for ordinary images. Browser metadata admission
 uses the same viewport policy; cheap filesystem metadata is published before
 media inspection or directory counting. Each completed detail is published
 without waiting for other probes. Viewport fills keep one active batch per folder,
@@ -136,6 +199,15 @@ not a wall-clock guarantee: long probes, source I/O, and the existing fill budge
 can still delay details; a one-worker configuration must serialize decoding and
 probing.
 
+Still-image quick previews and document media (images, Mermaid diagrams, equations) reuse
+the same supervisor implementation through a **second pool**, so an interactive
+Space preview never queues behind a scrolled directory's thumbnail flood. Both
+pools share the launcher thread, idle retirement, per-job isolation, and cache
+machinery; the cache keys results by source version *and* operation so a
+256-pixel thumbnail can never satisfy an 800-pixel preview of the same file.
+Each preview still runs in a freshly forked, Landlock/seccomp-confined decoder
+with per-job resource limits — only the supervisor process is reused.
+
 `RUST_LOG=strata::sandbox::browser=debug` records supervisor starts and operation
 latencies and idle retirements without source paths. It is useful for verifying
 reuse: repeated cold files within the idle timeout should produce jobs, not a new
@@ -152,10 +224,11 @@ raster images. Emoji icons retain Pango/Cairo rendering
 but pass raw pixels to GTK instead of encoding and decoding an intermediate PNG.
 
 This in-process icon path is not used for user SVGs, phone photos, or thumbnails
-of originals; those keep their sandbox boundary. Markdown SVGs, Mermaid diagrams, and equation
-output use a separate `resvg` path inside the sandbox, with font loading enabled
-there and image references disabled. No toolkit libraries or private media
-runtime patches are updated by this change.
+of originals; those keep their sandbox boundary. User SVG previews and
+thumbnails, Markdown SVGs, Mermaid diagrams, and equation output use a separate
+`resvg` path inside the sandbox, with image references disabled and system font
+loading enabled only when the document contains text. No toolkit libraries or
+private media runtime patches are updated by this change.
 
 ## Remote still-image previews
 
@@ -225,8 +298,9 @@ resolution; audio/video duration and overall bitrate; video codec and frame rate
 and audio codec, sample rate, and channel count. These describe the original file,
 not the preview's scaled frames or resampled audio. Attached album artwork is not
 reported as a video track, and still images do not show synthetic video timing.
-Missing individual fields are omitted; an unsuccessful inspection shows
-`Media: Unavailable` without blocking the other file information.
+For ordinary images and audio/video, missing individual fields are omitted; an
+unsuccessful inspection shows `Media: Unavailable` without blocking the other
+file information.
 
 Properties uses an asynchronous inspector. Only regular files with a
 local source are inspected; remote files are not downloaded for metadata. The
@@ -238,8 +312,38 @@ sandboxes expose only the optional BLAS/LAPACK runtime alternatives for supporte
 x86-64 and ARM64 Debian-family installations, not all of `/etc/alternatives`. Only
 validated numeric fields and bounded codec identifiers reach the UI, not arbitrary
 embedded tags. Closing Properties cancels its work and prevents stale results
-from appearing. The preview pane retains only its normal size, modified date,
-and type information; it does not run this metadata inspector.
+from appearing. Ordinary image and audio/video previews retain their normal size,
+modified date, and type information; they do not run this metadata inspector.
+
+Camera RAW files additionally show **Dimensions, Camera, Lens, Focal length,
+Shutter speed, ISO, and GPS coordinates**, in that order, in both the preview
+panel and Properties. All seven fields remain visible; missing or unreadable
+values show `N/A`. Dimensions describe the original image, account for orientation,
+and never use an embedded thumbnail's size. GPS is signed decimal latitude,
+then longitude; there is no reverse geocoding or network request. Shutter speeds
+use `1/N s` for integer reciprocals and decimal seconds otherwise (for example,
+`0.3 s`, not `1/3.333 s`).
+
+RAW inspection reuses LibRaw's `raw-identify -v` or classic `dcraw -i -v` when
+installed, with a three-second limit per identification attempt. The bundled
+`kamadak-exif` reader supplements capture and GPS tags from supported EXIF
+containers, including TIFF-based RAW files, without decoding pixels. It is also
+the fallback when those optional utilities are absent. ImageMagick's RAW metadata
+output is not used: DNG redirection and incomplete EXIF exposure vary by version.
+Support depends on the format and available tools; unavailable tags in other
+RAW containers remain `N/A`.
+
+Both parsers run only inside a short-lived, software-only sandbox with the
+existing 512 MiB input limit, memory/CPU/wall-time limits, and a 64 KiB output
+budget. Only the seven validated properties reach the UI; camera/lens strings
+are bounded plain text. Locally backed Trash entries use their existing local
+thumbnail source, recognizing the original display-name extension even when the
+stored filename has a collision suffix. Remote RAW files are not downloaded for
+metadata and show `N/A`. Selection changes and closing either surface cancel
+pending work.
+RAW preview labels remain in place during selection debounce and metadata loading;
+only their values reset to `N/A` and update when inspection completes.
+Detailed RAW inspection does not run for browser thumbnails.
 
 ## Incremental media playback
 
@@ -349,8 +453,8 @@ have separate limits, not a machine-global scheduler.
 
 | State | Bound / behavior |
 | --- | --- |
-| Startup or seek | 22 seconds from request to first frame; includes a 4-second probe, hardware attempts of at most 4 seconds each / 8 seconds combined, and up to 8 seconds for software. |
-| Active decoding | 8 seconds for a complete next record, not a deadline restarted by each byte. A stalled audio playback clock also fails after 8 seconds. |
+| Startup or seek | 22 seconds from request to first frame; includes a 4-second probe, hardware attempts of at most 4 seconds each / 8 seconds combined, and up to 8 seconds for software. Isolated seeks restart at once; bursts within 200 ms coalesce to the settled position. |
+| Active decoding | 8 seconds for a complete next record, not a deadline restarted by each byte. A stall mid-playback (frozen audio clock, decoder/worker failure, audio-sink error) restarts at the last position up to 3 times, then fails with the last error. |
 | Backpressure | A full queue stops consumption and propagates pressure through bounded pipes; it does not accumulate a whole clip. Waiting for the consumer is not charged as decoder progress time. |
 | Paused | Keep position, frame and bounded queues for 30 seconds, then cancel the worker, drop PCM output/queues, and stop the polling timer. The displayed frame and position remain. Resume or a paused seek starts a new bounded decode. |
 | Close / selection change / destruction | Cancel promptly; pipe/queue waits check cancellation at 10–20-ms intervals. Kill/reap the renderer and its sandbox descendants. No join of a blocked pipe reader on the GTK thread. |

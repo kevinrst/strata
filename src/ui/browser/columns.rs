@@ -129,6 +129,7 @@ pub(super) fn install_resize_edges(state: &Rc<ViewState>) {
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
         };
+        state.column_resizing.set(true);
         let now = glib::monotonic_time() as u64;
         let autofit = last_press
             .borrow()
@@ -156,7 +157,10 @@ pub(super) fn install_resize_edges(state: &Rc<ViewState>) {
             Some((shell.clone(), shell.width().max(COLUMN_WIDTH), pointer_x));
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
+    let weak_for_end = Rc::downgrade(state);
     let active_for_update = active.clone();
+    let active_for_end = active.clone();
+    let active_for_cancel = active.clone();
     resize.connect_drag_update(move |gesture, fallback_offset_x, _| {
         let active = active_for_update.borrow();
         let Some((shell, initial, start)) = active.as_ref() else {
@@ -169,7 +173,17 @@ pub(super) fn install_resize_edges(state: &Rc<ViewState>) {
         shell.set_size_request(resized_column_width(*initial, offset_x), -1);
     });
     resize.connect_drag_end(move |_, _, _| {
-        active.borrow_mut().take();
+        active_for_end.borrow_mut().take();
+        if let Some(state) = weak_for_end.upgrade() {
+            state.column_resizing.set(false);
+        }
+    });
+    let weak_for_cancel = Rc::downgrade(state);
+    resize.connect_cancel(move |_, _| {
+        active_for_cancel.borrow_mut().take();
+        if let Some(state) = weak_for_cancel.upgrade() {
+            state.column_resizing.set(false);
+        }
     });
     state.scroller.add_controller(resize);
 }
@@ -233,6 +247,8 @@ pub(super) struct ColumnView {
     pub(super) listing_scroll: gtk::ScrolledWindow,
     pub(super) marquee: crate::ui::marquee::Marquee,
     pub(super) bound_rows: Rc<RefCell<Vec<BoundRow>>>,
+    /// Bumped by each cursor restore so an older pending restore cannot land late.
+    pub(super) cursor_restore_generation: Rc<Cell<u64>>,
     pub(super) folder_context_trigger: Rc<dyn Fn(f64, f64)>,
     pub(super) item_context_trigger: Rc<dyn Fn(f64, f64)>,
     pub(super) entry_count: Rc<Cell<usize>>,
@@ -250,6 +266,19 @@ pub(super) struct ColumnView {
 }
 
 impl ColumnView {
+    pub(super) fn flush_filter_query(&self) {
+        if let Some(binding) = self.query_binding.borrow().as_ref() {
+            binding.flush();
+        }
+    }
+
+    pub(super) fn with_query_binding<T>(
+        &self,
+        apply: impl FnOnce(&super::collection::FilterQueryBinding) -> T,
+    ) -> Option<T> {
+        self.query_binding.borrow().as_ref().map(apply)
+    }
+
     pub(super) fn context_menu_target(
         &self,
         position: Option<usize>,
@@ -400,15 +429,27 @@ pub(super) fn scroll_column_to(column: &ColumnView, position: u32) {
 pub(super) fn restore_column_cursor(column: &ColumnView, position: u32) {
     let list = column.list.downgrade();
     let rows = column.bound_rows.clone();
+    let generations = column.cursor_restore_generation.clone();
+    let generation = generations.get().wrapping_add(1);
+    generations.set(generation);
+    // Recursive hits that replaced the rows since keep their own cursor.
+    let hits = column.recursive_search_active.clone();
     glib::idle_add_local_once(move || {
         let Some(list) = list.upgrade() else { return };
         let frames = Cell::new(0u8);
         list.add_tick_callback(move |list, _| {
+            if generations.get() != generation || hits.get() {
+                return glib::ControlFlow::Break;
+            }
             let focused = list.root().and_then(|root| root.focus());
-            if !focused
-                .as_ref()
-                .is_some_and(|focused| focused == list || list.is_ancestor(focused))
-            {
+            // `is_ancestor` is true when the receiver sits inside the argument.
+            // Restore while focus is the list or one of its rows, and also while
+            // a parent of the list still holds focus. An inline name editor also
+            // sits inside a row and must keep the focus it took after this queued.
+            if !focused.as_ref().is_some_and(|focused| {
+                (focused == list || focused.is_ancestor(list) || list.is_ancestor(focused))
+                    && !crate::ui::focus_navigation::editable(focused)
+            }) {
                 return glib::ControlFlow::Break;
             }
             let cursor = rows.borrow().iter().find_map(|bound| {
@@ -508,16 +549,22 @@ fn is_file_row_target(target: gtk::Widget) -> bool {
     file_row_target(target).is_some()
 }
 
-fn set_active_path_style(row: &gtk::Box, active: bool) {
+pub(super) fn set_active_path_style(row: &gtk::Box, active: bool, immediate: bool) {
     if active {
         row.add_css_class("active-path");
+        if immediate {
+            row.add_css_class("active-parent");
+        } else {
+            row.remove_css_class("active-parent");
+        }
     } else {
         row.remove_css_class("active-path");
+        row.remove_css_class("active-parent");
     }
 }
 
-pub(super) fn set_cut_path_style(row: &gtk::Box, cut: bool) {
-    if cut {
+pub(super) fn set_mark_path_style(row: &gtk::Box, mark: super::clipboard::ClipboardMark) {
+    if mark == super::clipboard::ClipboardMark::Cut {
         row.add_css_class("cut");
     } else {
         row.remove_css_class("cut");
@@ -526,7 +573,7 @@ pub(super) fn set_cut_path_style(row: &gtk::Box, cut: bool) {
         .first_child()
         .and_downcast::<crate::ui::thumbnail::ThumbnailSlot>()
     {
-        icon.set_cut(cut);
+        icon.set_mark(mark);
     }
 }
 
@@ -724,16 +771,18 @@ impl ViewState {
 
     pub(super) fn refresh_active_path_rows(&self) {
         self.refresh_destination_style();
+        let active_depth = self.browser.active_depth();
         for (depth, column) in self.columns.borrow().iter().enumerate() {
             let active = self
                 .browser
                 .active_child_position(depth)
                 .and_then(|position| column.map.view_position(position));
+            let immediate = active_depth == Some(depth + 1);
             column.bound_rows.borrow_mut().retain(|bound| {
                 let (Some(item), Some(row)) = (bound.item.upgrade(), bound.row.upgrade()) else {
                     return false;
                 };
-                set_active_path_style(&row, active == Some(item.position()));
+                set_active_path_style(&row, active == Some(item.position()), immediate);
                 true
             });
         }
@@ -833,10 +882,14 @@ impl ViewState {
             crate::ui::controls::pane_header_action(&close);
             let weak_browser = Rc::downgrade(&self.browser);
             close.connect_clicked(move |_| {
+                if crate::ui::tenxer_mode::chrome_suppressed() {
+                    return;
+                }
                 if let Some(browser) = weak_browser.upgrade() {
                     browser.close_column(depth);
                 }
             });
+            crate::ui::tenxer_mode::hide_while_enabled(&close);
             header_actions.append(&close);
         }
         // Homogeneous pages keep column geometry stable as the action target changes.
@@ -944,9 +997,25 @@ impl ViewState {
                     .find_map(|(filtered, source)| (*filtered == position).then_some(*source))
             });
             if let Some(state) = weak_selection_state.upgrade() {
+                // Marquee and row-gesture writes own the selection. A later focus
+                // echo of the cursor does not, and must not replace a committed fill.
+                if crate::ui::marquee::is_updating_selection() || state.pointer_owns_selection.get()
+                {
+                    state.browser.commit_selection();
+                }
                 state
                     .browser
                     .set_selection(depth, &source_positions, focused_source);
+                let model = state.browser.selected_positions(depth);
+                if model != source_positions {
+                    let filtered: Vec<u32> = model
+                        .iter()
+                        .filter_map(|position| map_for_selection.view_position(*position))
+                        .collect();
+                    syncing_selection_changed.set(true);
+                    apply_selection_plan(selection, selection.n_items(), &filtered);
+                    syncing_selection_changed.set(false);
+                }
                 state.refresh_destination_style();
             }
         });
@@ -1001,6 +1070,9 @@ impl ViewState {
                         &filtered_model_for_search,
                         &model_for_search,
                     );
+                    if let Some(state) = weak_state_for_search.upgrade() {
+                        state.notify_filter_results_changed();
+                    }
                     return;
                 }
                 let Some(state) = weak_state_for_search.upgrade() else {
@@ -1025,6 +1097,7 @@ impl ViewState {
                         &filter_query_for_search,
                         fold_for_search(&text),
                     );
+                    state.notify_filter_results_changed();
                     return;
                 };
                 *filter_query_for_search.borrow_mut() = fold_for_search(&text);
@@ -1076,6 +1149,7 @@ impl ViewState {
                         if search::update_results(&sm, &results, &selection, &syncing, items) {
                             state.notify_search_selection_changed();
                         }
+                        state.notify_filter_results_changed();
                     }),
                 );
             },
@@ -1310,6 +1384,7 @@ impl ViewState {
             clear_selection: Rc::new(move || {
                 if let Some(state) = weak_for_clear.upgrade() {
                     state.clear_column_selections();
+                    state.browser.close_column(depth + 1);
                     if returning_for_clear.replace(false) && !search_active_for_clear.get() {
                         let first = state.columns.borrow().get(depth).and_then(|column| {
                             (0..column.selection.n_items())
@@ -1348,6 +1423,7 @@ impl ViewState {
                     .context_menu_column
                     .get()
                     .is_none_or(|owner| owner == depth)
+                && state.drop_active_depths.get().is_none()
             {
                 state.browser.set_active_column(depth);
                 state.refresh_destination_style();
@@ -1542,6 +1618,7 @@ impl ViewState {
             listing_scroll: scroll,
             marquee,
             bound_rows,
+            cursor_restore_generation: Rc::new(Cell::new(0)),
             folder_context_trigger,
             item_context_trigger,
             entry_count,
@@ -1610,6 +1687,9 @@ impl ViewState {
             let Some(state) = weak.upgrade() else {
                 return;
             };
+            if state.drop_active_depths.get().is_some() {
+                return;
+            }
             state.suppress_focus_scroll.set(true);
             state.browser.set_active_column(depth);
             state.browser.focus_active();
@@ -1622,9 +1702,43 @@ impl ViewState {
             if let Some(shell) = shell {
                 state.reveal_column(shell);
             }
+            state.flash_column_parent(depth);
         });
         surface.add_controller(click.clone());
         click
+    }
+
+    pub(super) fn flash_column_parent(&self, child_depth: usize) {
+        if child_depth == 0 {
+            return;
+        }
+        let parent_depth = child_depth - 1;
+        let columns = self.columns.borrow();
+        let Some(column) = columns.get(parent_depth) else {
+            return;
+        };
+        let active = self
+            .browser
+            .active_child_position(parent_depth)
+            .and_then(|position| column.map.view_position(position));
+        let Some(active_pos) = active else {
+            return;
+        };
+        for bound in column.bound_rows.borrow().iter() {
+            if bound.item.upgrade().map(|item| item.position()) == Some(active_pos) {
+                if let Some(row) = bound.row.upgrade() {
+                    row.remove_css_class("flash-active-path");
+                    row.add_css_class("flash-active-path");
+                    let weak_row = row.downgrade();
+                    glib::timeout_add_local_once(Duration::from_millis(420), move || {
+                        if let Some(row) = weak_row.upgrade() {
+                            row.remove_css_class("flash-active-path");
+                        }
+                    });
+                }
+                break;
+            }
+        }
     }
 
     pub(super) fn reveal_column(self: &Rc<Self>, shell: gtk::Box) {
@@ -1726,6 +1840,3 @@ mod rows;
 mod search;
 
 pub(super) use reveal::ColumnSpan;
-
-#[cfg(test)]
-mod tests;

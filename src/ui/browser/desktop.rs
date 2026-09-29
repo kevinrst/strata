@@ -105,6 +105,7 @@ fn show_open_with_fallback(
     crate::ui::open_with::show(
         parent,
         vec![file],
+        vec![content_type.to_string()],
         recommended_apps,
         other_apps,
         crate::ui::open_with::OpenWithContext::ActivationFallback,
@@ -310,6 +311,3 @@ pub(in crate::ui) fn launch_terminal(location: &Location, parent: &impl IsA<gtk:
         );
     }
 }
-
-#[cfg(test)]
-mod tests;

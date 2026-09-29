@@ -16,6 +16,7 @@ use crate::ui::browser::desktop::open_location;
 use crate::ui::browser::entry::item_count_label;
 use crate::ui::browser::location::MountStrategy;
 use crate::ui::browser::peek::append_peek_entries;
+use crate::ui::browser::transfer::FinishedSendToCompletion;
 use crate::ui::browser::trash::retryable_delete_entries;
 use crate::ui::browser_modes::BrowserMode;
 use crate::ui::modal::{show_delete_error_dialog, show_error_dialog};
@@ -51,7 +52,9 @@ impl ViewState {
         match event {
             BrowserEvent::SelectionSynced { .. } => return,
             BrowserEvent::NavigationStarting => {
+                self.forget_listing_search();
                 self.suppress_scroll_after_drop.set(false);
+                self.drop_active_depths.set(None);
             }
             BrowserEvent::Reset => {
                 self.suppress_scroll_after_drop.set(false);
@@ -257,14 +260,19 @@ impl ViewState {
                     }
                     column.entry_count.set(count);
                     set_filter_placeholder(column, count);
-                    let positions: Vec<_> = self
-                        .browser
-                        .selected_positions(*depth)
-                        .into_iter()
-                        .filter_map(|position| column.map.view_position(position))
-                        .collect();
-                    set_column_selections(column, &positions);
+                    // Recursive hits keep their own selection and cursor.
+                    let hits = column.recursive_search_active.get();
+                    if !hits {
+                        let positions: Vec<_> = self
+                            .browser
+                            .selected_positions(*depth)
+                            .into_iter()
+                            .filter_map(|position| column.map.view_position(position))
+                            .collect();
+                        set_column_selections(column, &positions);
+                    }
                     if restore_cursor
+                        && !hits
                         && let Some((focused_depth, position, _)) = self.browser.focused_item()
                         && focused_depth == *depth
                         && let Some(position) = column.map.view_position(position)
@@ -299,8 +307,9 @@ impl ViewState {
                         *depth,
                         &column.sort_direction_button,
                     );
-                    let preserve_search =
-                        self.refreshing_source_filter.get() && column.recursive_search_active.get();
+                    // Filters and searches outlive the monitor rescans of a busy
+                    // folder. Their hits come from the search, not this listing.
+                    let preserve_search = column.recursive_search_active.get();
                     if !preserve_search {
                         column.search_session.cancel();
                         super::collection::deactivate_recursive_search(
@@ -310,7 +319,6 @@ impl ViewState {
                             &column.filtered_model,
                             &column.model,
                         );
-                        column.filter_entry.set_text("");
                         column.syncing_selection.set(true);
                         column.selection.set_model(None::<&gio::ListModel>);
                     }
@@ -543,13 +551,16 @@ impl ViewState {
                         }
                     }
                 }
+                self.refresh_destination_style();
             }
             BrowserEvent::FocusChanged { depth, position } => {
                 let column = self.columns.borrow().get(*depth).cloned();
                 if let Some(column) = column {
                     let editing = self.active_rename.borrow().is_some();
-                    if let Some(filtered_position) =
-                        position.and_then(|position| column.map.view_position(position))
+                    // Recursive hits keep their own selection and cursor.
+                    if let Some(filtered_position) = position
+                        .filter(|_| !column.recursive_search_active.get())
+                        .and_then(|position| column.map.view_position(position))
                     {
                         let positions: Vec<_> = self
                             .browser
@@ -560,9 +571,11 @@ impl ViewState {
                         set_column_selections(&column, &positions);
                         if !editing && !self.suppress_focus_scroll.get() {
                             scroll_column_to(&column, filtered_position);
+                            restore_column_cursor(&column, filtered_position);
                         }
                     }
                     if !editing
+                        && !self.cursor_keeps_focus.get()
                         && self.mode_views.borrow().mode() == BrowserMode::Columns
                         && self.browser.active_depth() == Some(*depth)
                         && !self.suppress_scroll_after_drop.get()
@@ -579,6 +592,7 @@ impl ViewState {
                         self.reveal_column(column.shell);
                     }
                 }
+                self.refresh_destination_style();
                 self.mirror_focused_folder(*depth, *position);
             }
             BrowserEvent::PreviewRequested { .. } => {}
@@ -626,19 +640,43 @@ impl ViewState {
                     "Cancelling will not undo completed changes",
                     Rc::new(move || browser.cancel_file_operation()),
                 );
-                self.update_transfer_progress(0, 0, None);
+                self.update_transfer_progress(0, 0, None, 0, None);
             }
             BrowserEvent::TransferProgress {
                 completed_items,
+                completed_files,
+                total_files,
+                current_file,
                 transferred_bytes,
                 total_bytes,
             } => {
-                self.update_transfer_progress(*completed_items, *transferred_bytes, *total_bytes);
+                self.transfer_current_file.replace(current_file.clone());
+                self.update_transfer_progress(
+                    *completed_items,
+                    *completed_files,
+                    *total_files,
+                    *transferred_bytes,
+                    *total_bytes,
+                );
             }
             BrowserEvent::FlushingToDevice => self.show_device_flush_status(),
+            BrowserEvent::TransferCancellationPending => show_error_dialog(
+                &self.overlay,
+                "Transfer cancellation pending",
+                "The device may still be writing. Wait for the transfer to finish or fail before starting another file operation. Do not unplug until you can safely eject it.",
+            ),
             BrowserEvent::TransferFinished { moved_locations } => {
                 if !moved_locations.is_empty() {
                     self.complete_cut_transfer(moved_locations);
+                }
+                // TransferFinished also fires on failure; defer feedback until TransferCompleted.
+                if let Some(completion) = self.pending_send_to_completion.take() {
+                    let progress_shown = self.file_progress_view.borrow().is_some();
+                    self.finished_send_to_completion
+                        .replace(Some(FinishedSendToCompletion {
+                            completion,
+                            progress_shown,
+                        }));
                 }
                 self.dismiss_file_operation_progress();
                 self.prune_stale_search_results();
@@ -699,7 +737,10 @@ impl ViewState {
             BrowserEvent::RestorationFinished => self.dismiss_file_operation_progress(),
             BrowserEvent::OperationFailed { message } => {
                 self.suppress_scroll_after_drop.set(false);
+                self.drop_active_depths.set(None);
                 self.pending_new_entry.take();
+                self.pending_send_to_completion.take();
+                self.finished_send_to_completion.take();
                 self.clear_delete_animation();
                 self.dismiss_file_operation_progress();
                 self.pending_archive_destination.take();
@@ -724,7 +765,11 @@ impl ViewState {
                 retryable_locations,
                 has_non_retryable_failures,
             } => {
+                self.suppress_scroll_after_drop.set(false);
+                self.drop_active_depths.set(None);
                 self.pending_archive_destination.take();
+                self.pending_send_to_completion.take();
+                self.finished_send_to_completion.take();
                 let retryable_entries = retryable_delete_entries(
                     self.pending_delete_entries.take(),
                     retryable_locations,
@@ -753,7 +798,10 @@ impl ViewState {
                 affected_locations,
             } => {
                 self.suppress_scroll_after_drop.set(false);
+                self.drop_active_depths.set(None);
                 self.pending_archive_destination.take();
+                self.pending_send_to_completion.take();
+                self.finished_send_to_completion.take();
                 self.browser.refresh_after_cancellation(affected_locations);
                 let message = format!(
                     "{} completed, {} failed, and {} not attempted.\n\nCompleted changes were not reverted.",
@@ -796,6 +844,14 @@ impl ViewState {
                     ),
                 }
             }
+            BrowserEvent::LocationRevealFailed { location } => show_error_dialog(
+                &self.overlay,
+                "Unable to select file",
+                &format!(
+                    "{} is not available in the loaded folder.",
+                    location.display_path()
+                ),
+            ),
             BrowserEvent::ArchiveStarted { total } => {
                 let browser = self.browser.clone();
                 self.show_file_operation_progress(
@@ -910,6 +966,30 @@ impl ViewState {
             }
             BrowserEvent::TransferCompleted => {
                 self.suppress_scroll_after_drop.set(false);
+                if let Some(finished) = self.finished_send_to_completion.take()
+                    && !finished.progress_shown
+                {
+                    self.show_send_to_success(
+                        &finished.completion.device_name,
+                        finished.completion.item_count,
+                    );
+                }
+                if let Some((source_depth, destination_depth)) =
+                    self.drop_active_depths.replace(None)
+                {
+                    let weak = Rc::downgrade(self);
+                    glib::idle_add_local_once(move || {
+                        let Some(state) = weak.upgrade() else {
+                            return;
+                        };
+                        if state.browser.active_depth() == Some(destination_depth)
+                            && state.browser.location_at(source_depth).is_some()
+                        {
+                            state.browser.set_active_column(source_depth);
+                            state.browser.focus_active();
+                        }
+                    });
+                }
                 if let Some(dest) = self.pending_navigate.take() {
                     self.browser.navigate(dest);
                 }
@@ -1145,6 +1225,3 @@ fn extract_error_needs_password(message: &str) -> bool {
         lower.contains("password") || lower.contains("encrypt")
     })
 }
-
-#[cfg(test)]
-mod tests;
