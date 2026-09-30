@@ -586,7 +586,11 @@ where
     shell.layout.cancel.set_visible(false);
     shell.layout.confirm.set_sensitive(false);
     shell.layout.close.set_sensitive(false);
-    shell.layout.set_loading(true, Some("Formatting drive"));
+    let activity = gtk::Spinner::new();
+    activity.add_css_class("action-dialog-loading");
+    activity.set_valign(gtk::Align::Center);
+    activity.set_tooltip_text(Some("Formatting drive"));
+    activity.start();
     let message = gtk::Label::new(Some(
         "Formatting the drive. Do not unplug it until formatting finishes.",
     ));
@@ -594,7 +598,10 @@ where
     message.set_wrap(true);
     message.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     message.set_max_width_chars(40);
-    shell.layout.body.append(&message);
+    let status = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    status.append(&activity);
+    status.append(&message);
+    shell.layout.body.append(&status);
 
     let finished = Rc::new(Cell::new(false));
     let layer = shell.layer.downgrade();
@@ -628,7 +635,8 @@ where
     let display_name = display_name.to_owned();
     glib::MainContext::default().spawn_local(async move {
         let result = task(task_parent).await;
-        shell.layout.set_loading(false, None);
+        activity.stop();
+        activity.set_visible(false);
         match result {
             Ok(()) => {
                 finished.set(true);

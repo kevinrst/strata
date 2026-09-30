@@ -98,7 +98,13 @@ fn format_feedback_reports_success_failure_and_authorization_cancellation() {
                 let widgets = descendants(overlay.upcast_ref());
                 let loading = widgets
                     .iter()
-                    .find_map(|widget| widget.clone().downcast::<gtk::Spinner>().ok())
+                    .find_map(|widget| {
+                        widget
+                            .clone()
+                            .downcast::<gtk::Spinner>()
+                            .ok()
+                            .filter(|spinner| spinner.is_visible())
+                    })
                     .expect("formatting activity spinner");
                 assert!(loading.is_spinning());
                 let close = widgets
