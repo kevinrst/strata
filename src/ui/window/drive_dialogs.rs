@@ -2,19 +2,60 @@
 
 //! Removable-drive dialogs: Format, Rename (volume label), Properties.
 
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, future::Future, rc::Rc};
 
 use gtk::{gio, glib, prelude::*};
 
 use crate::{
     assets,
+    services::package_manager::PackageManager,
     ui::{
-        controls::{ModalLayout, form_check_button, form_entry, form_label, modal_layout},
-        modal::{ModalHost, dismiss_modal_layer, modal_layer},
+        controls::{
+            FormTextField, ModalLayout, ModalTone, ProgressSummary, form_check_button, form_label,
+            modal_layout, progress_summary, properties_action,
+        },
+        missing_tools::{MissingTool, show_missing_tools},
+        modal::{ModalHost, dismiss_modal_layer, modal_layer, remember_modal_focus},
     },
 };
 
 use super::drive_ops::{self, FilesystemType};
+
+#[cfg(test)]
+pub(super) mod tests;
+
+pub(super) fn open_from_sidebar(
+    view: &super::BrowserView,
+    popover: Option<&gtk::Popover>,
+    show: impl FnOnce(),
+) {
+    if let Some(popover) = popover {
+        popover.popdown();
+    }
+    show();
+    let window = view.widget().root().and_downcast::<gtk::Window>();
+    if let Some(layer) = window.as_ref().and_then(super::visible_modal_layer) {
+        let view = view.downgrade();
+        crate::ui::modal::set_modal_focus_restore(
+            &layer,
+            Rc::new(move || {
+                if let Some(view) = view.upgrade() {
+                    // Resolve the current pane after formatting or a view rebuild.
+                    view.focus_file_view();
+                }
+            }),
+        );
+    } else {
+        view.focus_file_view();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PropertyAction {
+    Rename,
+    Eject,
+    Format,
+}
 
 struct ModalShell {
     layout: ModalLayout,
@@ -44,6 +85,7 @@ fn modal_shell(
         host.blurred_root.clone(),
         Some(Rc::new(|| true)),
     );
+    remember_modal_focus(&layer, &host.overlay);
     host.overlay.add_overlay(&layer);
     Some(ModalShell {
         layout,
@@ -55,9 +97,6 @@ fn modal_shell(
 
 fn field_block(label_text: &str, field: &impl IsA<gtk::Widget>) -> gtk::Box {
     let block = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    block.set_margin_top(8);
-    block.set_margin_start(16);
-    block.set_margin_end(16);
     let label = form_label(label_text);
     label.set_xalign(0.0);
     block.append(&label);
@@ -66,14 +105,37 @@ fn field_block(label_text: &str, field: &impl IsA<gtk::Widget>) -> gtk::Box {
     block
 }
 
+fn required_drive_tool(fs: FilesystemType, name: &'static str) -> MissingTool<'static> {
+    use PackageManager::{Apt, Dnf, Pacman, Zypper};
+    let packages: &[(PackageManager, &str)] = match fs {
+        FilesystemType::Fat32 => &[
+            (Pacman, "dosfstools"),
+            (Apt, "dosfstools"),
+            (Dnf, "dosfstools"),
+            (Zypper, "dosfstools"),
+        ],
+        FilesystemType::Ntfs => &[
+            (Pacman, "ntfsprogs"),
+            (Apt, "ntfs-3g"),
+            (Dnf, "ntfsprogs"),
+            (Zypper, "ntfs-3g"),
+        ],
+        FilesystemType::Exfat => &[
+            (Pacman, "exfatprogs"),
+            (Apt, "exfatprogs"),
+            (Dnf, "exfatprogs"),
+            (Zypper, "exfatprogs"),
+        ],
+    };
+    MissingTool { name, packages }
+}
+
 fn inline_error() -> gtk::Label {
     let label = gtk::Label::new(None);
     label.add_css_class("form-error");
     label.set_xalign(0.0);
     label.set_wrap(true);
     label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    label.set_margin_start(16);
-    label.set_margin_end(16);
     label.set_visible(false);
     label
 }
@@ -98,23 +160,86 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+fn capacity_summary(total: u64, available: u64) -> ProgressSummary {
+    let used = total.saturating_sub(available);
+    let fraction = used as f64 / total.max(1) as f64;
+    let summary = progress_summary("Used");
+    summary
+        .amount
+        .set_text(&format!("{} / {}", human_size(used), human_size(total)));
+    summary.percent.set_visible(false);
+    summary.progress.set_fraction(fraction);
+    summary
+}
+
 fn refresh_format_validity(
     available: &[FilesystemType],
     fs_combo: &gtk::DropDown,
     label_entry: &gtk::Entry,
-    limit_hint: &gtk::Label,
     confirm_btn: &gtk::Button,
 ) {
-    let Some(fs_type) = available.get(fs_combo.selected() as usize).copied() else {
+    let fs_type = available.get(fs_combo.selected() as usize).copied();
+    refresh_format_selection(
+        fs_type,
+        fs_type.is_some_and(|fs| fs.available()),
+        label_entry,
+        confirm_btn,
+    );
+}
+
+fn refresh_format_selection(
+    fs_type: Option<FilesystemType>,
+    tools_available: bool,
+    label_entry: &gtk::Entry,
+    confirm_btn: &gtk::Button,
+) {
+    let Some(fs_type) = fs_type else {
         confirm_btn.set_sensitive(false);
         return;
     };
-    limit_hint.set_text(&format!(
-        "{} labels hold at most {} characters.",
-        fs_type.label(),
-        fs_type.max_label_len()
-    ));
-    confirm_btn.set_sensitive(label_entry.text().chars().count() <= fs_type.max_label_len());
+    let max_length = fs_type.max_label_len() as i32;
+    if label_entry.max_length() != max_length {
+        label_entry.set_max_length(max_length);
+    }
+    confirm_btn.set_sensitive(
+        tools_available && label_entry.text().chars().count() <= fs_type.max_label_len(),
+    );
+}
+
+fn wire_entry_submission(entry: &gtk::Entry, confirm: &gtk::Button) {
+    let confirm = confirm.downgrade();
+    entry.connect_activate(move |_| {
+        if let Some(confirm) = confirm.upgrade() {
+            confirm.emit_clicked();
+        }
+    });
+}
+
+fn rename_validation_error(label: &str, current_name: &str, max_len: usize) -> Option<String> {
+    if label.trim().is_empty() {
+        Some("The label cannot be empty.".to_owned())
+    } else if label == current_name {
+        Some("Enter a label different from the current one.".to_owned())
+    } else if label.chars().count() > max_len {
+        Some(format!(
+            "Labels on this volume hold at most {max_len} characters."
+        ))
+    } else {
+        None
+    }
+}
+
+fn refresh_rename_validity(
+    entry: &gtk::Entry,
+    current_name: &str,
+    max_len: usize,
+    tools_available: bool,
+    confirm: &gtk::Button,
+) {
+    let text = entry.text();
+    confirm.set_sensitive(
+        tools_available && rename_validation_error(&text, current_name, max_len).is_none(),
+    );
 }
 
 /// Wire Cancel and Escape. Each dialog connects its own confirm button.
@@ -145,7 +270,11 @@ fn wire_modal_close(shell: &ModalShell) {
 
 /// Properties: name, device, filesystem, mount status, capacity bar.
 /// Everything is read synchronously; unavailable data shows as em dash.
-pub(super) fn show_drive_properties(parent: &gtk::Widget, volume: &gio::Volume) {
+pub(super) fn show_drive_properties(
+    parent: &gtk::Widget,
+    volume: &gio::Volume,
+    on_release: Option<Rc<dyn Fn()>>,
+) {
     let name = volume.name().to_string();
     let volume = volume.clone();
     let Some(shell) = modal_shell(
@@ -159,13 +288,19 @@ pub(super) fn show_drive_properties(parent: &gtk::Widget, volume: &gio::Volume) 
         return;
     };
 
+    shell
+        .layout
+        .content
+        .add_css_class("drive-properties-content");
+    shell.layout.subtitle.set_max_width_chars(44);
+    shell
+        .layout
+        .subtitle
+        .set_ellipsize(gtk::pango::EllipsizeMode::End);
+
     let grid = gtk::Grid::new();
     grid.set_column_spacing(12);
     grid.set_row_spacing(8);
-    grid.set_margin_top(8);
-    grid.set_margin_start(16);
-    grid.set_margin_end(16);
-    grid.set_margin_bottom(8);
     grid.set_hexpand(true);
     grid.set_column_homogeneous(false);
 
@@ -178,6 +313,7 @@ pub(super) fn show_drive_properties(parent: &gtk::Widget, volume: &gio::Volume) 
         value.set_hexpand(true);
         value.set_selectable(true);
         value.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        value.set_max_width_chars(48);
         grid.attach(&label, 0, row, 1, 1);
         grid.attach(&value, 1, row, 1, 1);
         row += 1;
@@ -225,16 +361,9 @@ pub(super) fn show_drive_properties(parent: &gtk::Widget, volume: &gio::Volume) 
                     add_row("Capacity", &human_size(total));
                     add_row("Used", &human_size(used));
                     add_row("Free", &human_size(available));
-                    let bar = gtk::ProgressBar::new();
-                    bar.set_fraction(used as f64 / total as f64);
-                    bar.set_show_text(true);
-                    bar.set_text(Some(&format!(
-                        "{} of {} used",
-                        human_size(used),
-                        human_size(total)
-                    )));
-                    bar.set_margin_top(8);
-                    grid.attach(&bar, 0, row, 2, 1);
+                    let summary = capacity_summary(total, available);
+                    summary.widget.set_margin_top(8);
+                    grid.attach(&summary.widget, 0, row, 2, 1);
                 }
                 (Some(total), None) => {
                     add_row("Capacity", &human_size(total));
@@ -255,10 +384,77 @@ pub(super) fn show_drive_properties(parent: &gtk::Widget, volume: &gio::Volume) 
 
     shell.layout.confirm.set_visible(false);
     shell.layout.cancel.set_visible(false);
+    while let Some(child) = shell.layout.actions.first_child() {
+        shell.layout.actions.remove(&child);
+    }
+    shell.layout.actions.add_css_class("properties-actions");
+    shell.layout.actions.set_homogeneous(true);
+    let responsive_actions = shell.layout.actions.clone();
+    shell.layout.content.add_tick_callback(move |content, _| {
+        let compact = content.has_css_class("modal-constrained");
+        let orientation = if compact {
+            gtk::Orientation::Vertical
+        } else {
+            gtk::Orientation::Horizontal
+        };
+        if responsive_actions.orientation() != orientation {
+            responsive_actions.set_orientation(orientation);
+            responsive_actions.set_homogeneous(!compact);
+        }
+        glib::ControlFlow::Continue
+    });
     wire_modal_close(&shell);
+    for (action, label, icon) in [
+        (PropertyAction::Rename, "Rename", assets::icons::PENCIL),
+        (PropertyAction::Eject, "Eject", assets::icons::EJECT),
+        (PropertyAction::Format, "Format", assets::icons::SHREDDER),
+    ] {
+        let tone = if matches!(action, PropertyAction::Format) {
+            ModalTone::Danger
+        } else {
+            ModalTone::Accent
+        };
+        let button = properties_action(icon, label, tone);
+        if matches!(action, PropertyAction::Eject) {
+            button.set_sensitive(on_release.is_some());
+        }
+        let parent = parent.clone();
+        let volume = volume.clone();
+        let layer = shell.layer.clone();
+        let overlay = shell.overlay.clone();
+        let root = shell.blurred_root.clone();
+        let on_release = on_release.clone();
+        button.connect_clicked(move |_| {
+            dismiss_modal_layer(&layer, &overlay, root.as_ref());
+            match action {
+                PropertyAction::Rename => show_rename_dialog(&parent, &volume),
+                PropertyAction::Format => show_format_dialog(&parent, &volume),
+                PropertyAction::Eject => {
+                    if let Some(on_release) = &on_release {
+                        on_release();
+                    }
+                }
+            }
+        });
+        shell.layout.actions.append(&button);
+        if matches!(action, PropertyAction::Rename) {
+            button.grab_focus();
+        }
+    }
 }
 
 pub(super) fn show_rename_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
+    let detected_fs = drive_ops::block_device_for_volume(volume)
+        .map(|device| drive_ops::filesystem_of_device(&device));
+    let fs = detected_fs.unwrap_or(FilesystemType::Fat32);
+    if !fs.label_tool_available() {
+        show_missing_tools(
+            parent,
+            "Renaming this volume requires an additional filesystem label tool.",
+            &[required_drive_tool(fs, fs.label_cmd())],
+        );
+        return;
+    }
     let name = volume.name().to_string();
     let volume = volume.clone();
     let Some(shell) = modal_shell(
@@ -272,40 +468,31 @@ pub(super) fn show_rename_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
         return;
     };
 
-    let current = gtk::Label::new(Some(&name));
-    current.set_xalign(0.0);
-    current.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    shell.layout.content.set_width_request(480);
+    shell.layout.subtitle.set_max_width_chars(32);
+    shell
+        .layout
+        .subtitle
+        .set_ellipsize(gtk::pango::EllipsizeMode::End);
+
+    let max_len = detected_fs.map(|fs| fs.max_label_len()).unwrap_or(11);
+    let filesystem = gtk::Label::new(Some(detected_fs.map(|fs| fs.label()).unwrap_or("Unknown")));
+    filesystem.set_xalign(0.0);
     shell
         .layout
         .body
-        .append(&field_block("Current label", &current));
+        .append(&field_block("Filesystem", &filesystem));
 
-    let entry = form_entry();
-    entry.set_placeholder_text(Some("New volume label"));
+    let field = FormTextField::with_character_limit(max_len as i32);
+    let entry = field.entry;
+    entry.set_placeholder_text(Some("Volume label"));
+    entry.set_max_width_chars(32);
     entry.set_text(&name);
     entry.select_region(0, -1);
-    shell.layout.body.append(&field_block("New label", &entry));
-
-    // Label limits differ per filesystem (FAT32: 11 chars). Detect upfront
-    // so overlong labels are rejected here
-    let detected_fs = drive_ops::block_device_for_volume(&volume)
-        .map(|device| drive_ops::filesystem_of_device(&device));
-    let max_len = detected_fs.map(|fs| fs.max_label_len()).unwrap_or(11);
-    entry.set_max_length(max_len as i32);
-    let fs_info = gtk::Label::new(Some(&match detected_fs {
-        Some(fs) => format!(
-            "Filesystem: {} — labels hold at most {} characters",
-            fs.label(),
-            fs.max_label_len()
-        ),
-        None => "Filesystem: unknown — keeping the label short is safest".to_owned(),
-    }));
-    fs_info.add_css_class("dim-label");
-    fs_info.set_xalign(0.0);
-    fs_info.set_wrap(true);
-    fs_info.set_margin_start(16);
-    fs_info.set_margin_end(16);
-    shell.layout.body.append(&fs_info);
+    shell
+        .layout
+        .body
+        .append(&field_block("Label", &field.widget));
 
     // The label tools need exclusive access, so a mounted volume is
     // unmounted first. Only say so when that actually applies.
@@ -315,51 +502,49 @@ pub(super) fn show_rename_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
         ));
         hint.add_css_class("dim-label");
         hint.set_xalign(0.0);
+        hint.set_max_width_chars(40);
         hint.set_wrap(true);
-        hint.set_margin_start(16);
-        hint.set_margin_end(16);
+        hint.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         shell.layout.body.append(&hint);
     }
 
     let error = inline_error();
+    error.set_max_width_chars(40);
     shell.layout.body.append(&error);
 
     let confirm = shell.layout.confirm.clone();
     confirm.set_sensitive(false);
     {
-        let confirm = confirm.clone();
+        let confirm = confirm.downgrade();
         let current_name = name.clone();
         entry.connect_changed(move |entry| {
-            let text = entry.text();
-            confirm.set_sensitive(
-                !text.trim().is_empty() && text != current_name && text.chars().count() <= max_len,
+            let Some(confirm) = confirm.upgrade() else {
+                return;
+            };
+            refresh_rename_validity(
+                entry,
+                &current_name,
+                max_len,
+                fs.label_tool_available(),
+                &confirm,
             );
         });
     }
 
+    wire_entry_submission(&entry, &confirm);
     let shell_layer = shell.layer.clone();
     let shell_overlay = shell.overlay.clone();
     let shell_root = shell.blurred_root.clone();
     let parent = parent.clone();
     let fired = Rc::new(Cell::new(false));
+    let submitted_entry = entry.clone();
     shell.layout.confirm.connect_clicked(move |_| {
         if fired.get() {
             return;
         }
-        let new_label = entry.text().to_string();
-        if new_label.trim().is_empty() {
-            show_inline_error(&error, "The label cannot be empty.");
-            return;
-        }
-        if new_label == name {
-            show_inline_error(&error, "Enter a label different from the current one.");
-            return;
-        }
-        if new_label.chars().count() > max_len {
-            show_inline_error(
-                &error,
-                &format!("Labels on this volume hold at most {max_len} characters."),
-            );
+        let new_label = submitted_entry.text().to_string();
+        if let Some(message) = rename_validation_error(&new_label, &name, max_len) {
+            show_inline_error(&error, &message);
             return;
         }
         fired.set(true);
@@ -374,11 +559,121 @@ pub(super) fn show_rename_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
         });
     });
     wire_modal_close_except_confirm(&shell);
+    entry.grab_focus();
+}
+
+fn run_format_with_feedback<F, Fut>(parent: &gtk::Widget, display_name: &str, task: F)
+where
+    F: FnOnce(gtk::Widget) -> Fut + 'static,
+    Fut: Future<Output = Result<(), drive_ops::DriveOpError>> + 'static,
+{
+    let Some(shell) = modal_shell(
+        parent,
+        assets::icons::SHREDDER,
+        "Formatting drive",
+        display_name,
+        "Close",
+        false,
+    ) else {
+        return;
+    };
+    shell.layout.content.set_width_request(480);
+    shell.layout.subtitle.set_max_width_chars(32);
+    shell
+        .layout
+        .subtitle
+        .set_ellipsize(gtk::pango::EllipsizeMode::End);
+    shell.layout.cancel.set_visible(false);
+    shell.layout.confirm.set_sensitive(false);
+    shell.layout.close.set_sensitive(false);
+    shell.layout.set_loading(true, Some("Formatting drive"));
+    let message = gtk::Label::new(Some(
+        "Formatting the drive. Do not unplug it until formatting finishes.",
+    ));
+    message.set_xalign(0.0);
+    message.set_wrap(true);
+    message.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    message.set_max_width_chars(40);
+    shell.layout.body.append(&message);
+
+    let finished = Rc::new(Cell::new(false));
+    let layer = shell.layer.downgrade();
+    let overlay = shell.overlay.downgrade();
+    let root = shell.blurred_root.as_ref().map(|root| root.downgrade());
+    let can_close = finished.clone();
+    let close = Rc::new(move || {
+        if can_close.get()
+            && let Some((layer, overlay)) = layer.upgrade().zip(overlay.upgrade())
+        {
+            let root = root.as_ref().and_then(glib::WeakRef::upgrade);
+            dismiss_modal_layer(&layer, &overlay, root.as_ref());
+        }
+    });
+    let clicked = close.clone();
+    shell.layout.confirm.connect_clicked(move |_| clicked());
+    let clicked = close.clone();
+    shell.layout.close.connect_clicked(move |_| clicked());
+    let escape = gtk::EventControllerKey::new();
+    escape.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    shell.layer.add_controller(escape);
+
+    let task_parent = shell.layout.content.clone().upcast::<gtk::Widget>();
+    let display_name = display_name.to_owned();
+    glib::MainContext::default().spawn_local(async move {
+        let result = task(task_parent).await;
+        shell.layout.set_loading(false, None);
+        match result {
+            Ok(()) => {
+                finished.set(true);
+                shell.layout.title.set_text("Format complete");
+                assets::set_primary_icon(&shell.layout.icon, assets::icons::CIRCLE_CHECK);
+                message.set_text(
+                    "The drive was formatted successfully. Click it in the sidebar to mount it.",
+                );
+                shell.layout.confirm.set_sensitive(true);
+                shell.layout.close.set_sensitive(true);
+                shell.layout.confirm.grab_focus();
+            }
+            Err(error) => {
+                dismiss_modal_layer(&shell.layer, &shell.overlay, shell.blurred_root.as_ref());
+                drive_ops::report_result(
+                    &shell.overlay.clone().upcast::<gtk::Widget>(),
+                    &display_name,
+                    Err(error),
+                );
+            }
+        }
+    });
 }
 
 /// Format in two steps: configure on step one, then review a summary and
 /// press the confirm button a second time.
 pub(super) fn show_format_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
+    let available = vec![
+        FilesystemType::Fat32,
+        FilesystemType::Ntfs,
+        FilesystemType::Exfat,
+    ];
+    let missing: Vec<_> = available
+        .iter()
+        .filter(|fs| !fs.available())
+        .map(|fs| required_drive_tool(*fs, fs.format_tool_name()))
+        .collect();
+    if !missing.is_empty() {
+        show_missing_tools(
+            parent,
+            "Formatting drives requires additional filesystem tools.",
+            &missing,
+        );
+        return;
+    }
     let name = volume.name().to_string();
     let device = drive_ops::block_device_for_volume(volume)
         .map(|path| path.display().to_string())
@@ -396,58 +691,23 @@ pub(super) fn show_format_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
         return;
     };
 
-    let available: Vec<FilesystemType> = [
-        FilesystemType::Fat32,
-        FilesystemType::Ntfs,
-        FilesystemType::Exfat,
-    ]
-    .into_iter()
-    .filter(|fs| fs.available())
-    .collect();
-    if available.is_empty() {
-        let missing = gtk::Label::new(Some(
-            "No formatting tools found. Install dosfstools, ntfs-3g, or exfatprogs to format drives.",
-        ));
-        missing.set_wrap(true);
-        missing.set_margin_start(16);
-        missing.set_margin_end(16);
-        shell.layout.body.append(&missing);
-        shell.layout.confirm.set_sensitive(false);
-        wire_modal_close(&shell);
-        return;
-    }
+    shell.layout.content.set_width_request(560);
 
     // Configuration
-    let step1 = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let options: Vec<&str> = available
-        .iter()
-        .map(|fs| {
-            let label = format!("{} \u{2014} {}", fs.label(), fs.description());
-            Box::leak(label.into_boxed_str()) as &str
-        })
-        .collect();
+    let step1 = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let options: Vec<&str> = available.iter().map(|fs| fs.label()).collect();
     let fs_combo = gtk::DropDown::from_strings(&options);
     fs_combo.set_selected(0);
     step1.append(&field_block("Filesystem", &fs_combo));
 
-    let label_entry = form_entry();
+    let label_field = FormTextField::with_character_limit(available[0].max_label_len() as i32);
+    let label_entry = label_field.entry;
     label_entry.set_placeholder_text(Some("Volume label (optional)"));
-    label_entry.set_max_length(32);
-    step1.append(&field_block("Label", &label_entry));
-
-    let limit_hint = gtk::Label::new(None);
-    limit_hint.add_css_class("dim-label");
-    limit_hint.set_xalign(0.0);
-    limit_hint.set_wrap(true);
-    limit_hint.set_margin_start(16);
-    limit_hint.set_margin_end(16);
-    step1.append(&limit_hint);
+    step1.append(&field_block("Label", &label_field.widget));
 
     let quick_check = form_check_button("Quick format");
     quick_check.set_active(true);
     let check_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    check_row.set_margin_top(8);
-    check_row.set_margin_start(16);
     check_row.append(&quick_check);
     step1.append(&check_row);
 
@@ -457,25 +717,21 @@ pub(super) fn show_format_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
         ));
         mount_note.add_css_class("dim-label");
         mount_note.set_xalign(0.0);
+        mount_note.set_max_width_chars(48);
         mount_note.set_wrap(true);
-        mount_note.set_margin_top(8);
-        mount_note.set_margin_start(16);
-        mount_note.set_margin_end(16);
+        mount_note.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         step1.append(&mount_note);
     }
     shell.layout.body.append(&step1);
 
     // Explicit confirmation
-    let step2 = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let step2 = gtk::Box::new(gtk::Orientation::Vertical, 12);
     step2.set_visible(false);
     let summary = gtk::Label::new(None);
     summary.set_xalign(0.0);
+    summary.set_max_width_chars(48);
     summary.set_wrap(true);
     summary.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    summary.set_margin_top(8);
-    summary.set_margin_start(16);
-    summary.set_margin_end(16);
-    summary.set_margin_bottom(8);
     step2.append(&summary);
     let warning = gtk::Label::new(Some(
         "This permanently erases ALL DATA on this volume. This cannot be undone.",
@@ -483,12 +739,9 @@ pub(super) fn show_format_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
     warning.add_css_class("form-message");
     warning.add_css_class("error");
     warning.set_xalign(0.0);
+    warning.set_max_width_chars(48);
     warning.set_wrap(true);
     warning.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    warning.set_margin_top(8);
-    warning.set_margin_start(16);
-    warning.set_margin_end(16);
-    warning.set_margin_bottom(8);
     step2.append(&warning);
     shell.layout.body.append(&step2);
 
@@ -497,43 +750,24 @@ pub(super) fn show_format_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
         let available = available.clone();
         let fs_combo = fs_combo.clone();
         let label_entry = label_entry.clone();
-        let limit_hint = limit_hint.clone();
         let confirm_btn = confirm_btn.clone();
         label_entry.clone().connect_changed(move |_| {
-            refresh_format_validity(
-                &available,
-                &fs_combo,
-                &label_entry,
-                &limit_hint,
-                &confirm_btn,
-            );
+            refresh_format_validity(&available, &fs_combo, &label_entry, &confirm_btn);
         });
     }
     {
         let available = available.clone();
         let fs_combo = fs_combo.clone();
         let label_entry = label_entry.clone();
-        let limit_hint = limit_hint.clone();
         let confirm_btn = confirm_btn.clone();
         fs_combo
             .clone()
             .connect_notify_local(Some("selected"), move |_, _| {
-                refresh_format_validity(
-                    &available,
-                    &fs_combo,
-                    &label_entry,
-                    &limit_hint,
-                    &confirm_btn,
-                );
+                refresh_format_validity(&available, &fs_combo, &label_entry, &confirm_btn);
             });
     }
-    refresh_format_validity(
-        &available,
-        &fs_combo,
-        &label_entry,
-        &limit_hint,
-        &confirm_btn,
-    );
+    refresh_format_validity(&available, &fs_combo, &label_entry, &confirm_btn);
+    wire_entry_submission(&label_entry, &confirm_btn);
 
     let shell_layer = shell.layer.clone();
     let shell_overlay = shell.overlay.clone();
@@ -541,6 +775,7 @@ pub(super) fn show_format_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
     let parent = parent.clone();
     let armed = Rc::new(Cell::new(false));
     let fired = Rc::new(Cell::new(false));
+    let submitted_label_entry = label_entry.clone();
     shell.layout.confirm.connect_clicked(move |_| {
         if fired.get() {
             return;
@@ -549,8 +784,8 @@ pub(super) fn show_format_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
             let Some(fs_type) = available.get(fs_combo.selected() as usize).copied() else {
                 return;
             };
-            let label = label_entry.text().to_string();
-            if label.chars().count() > fs_type.max_label_len() {
+            let label = submitted_label_entry.text().to_string();
+            if !fs_type.available() || label.chars().count() > fs_type.max_label_len() {
                 return;
             }
             let size = drive_ops::block_device_for_volume(&volume)
@@ -573,6 +808,7 @@ pub(super) fn show_format_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
             step1.set_visible(false);
             step2.set_visible(true);
             confirm_btn.set_label("Format");
+            confirm_btn.grab_focus();
             armed.set(true);
             return;
         }
@@ -581,20 +817,15 @@ pub(super) fn show_format_dialog(parent: &gtk::Widget, volume: &gio::Volume) {
         let Some(fs_type) = available.get(fs_combo.selected() as usize).copied() else {
             return;
         };
-        let label = label_entry.text().to_string();
+        let label = submitted_label_entry.text().to_string();
         let quick = quick_check.is_active();
-        let task_parent = parent.clone();
         let task_volume = volume.clone();
-        let display = name.clone();
-        drive_ops::spawn_drive_task(task_parent.clone(), display, move || {
-            let volume = task_volume.clone();
-            let label = label.clone();
-            async move {
-                drive_ops::format_volume(task_parent.clone(), volume, fs_type, label, quick).await
-            }
+        run_format_with_feedback(&parent, &name, move |task_parent| async move {
+            drive_ops::format_volume(task_parent, task_volume, fs_type, label, quick).await
         });
     });
     wire_modal_close_except_confirm(&shell);
+    label_entry.grab_focus();
 }
 
 /// Wire Cancel and Escape without touching the confirm button, which each

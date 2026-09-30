@@ -284,7 +284,8 @@ impl Dispatcher {
     pub(super) fn context_menu_command(&self, event: &KeyEvent) -> KeyResult {
         if is_context_menu_shortcut(event.key, event.modifiers)
             && !event.text_has_focus()
-            && self.view.open_focused_context_menu()
+            && (super::sidebar::open_sidebar_context_menu(&self.sidebar.widget)
+                || self.view.open_focused_context_menu())
         {
             return Some(Propagation::Stop);
         }

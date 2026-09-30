@@ -814,7 +814,7 @@ headerbar menubutton.header-action > button:focus-visible {
 }
 
 .action-dialog-body {
-  padding: 20px;
+  padding: 14px 20px;
 }
 
 .action-dialog-actions {
@@ -2085,6 +2085,10 @@ scrollbar.horizontal > range > trough > slider {
 
 .sidebar-device-spinner {
   color: @theme_accent;
+  -gtk-icon-size: 14px;
+  min-height: 14px;
+  min-width: 14px;
+  padding: 0;
 }
 
 .sidebar-eject:hover,
@@ -3590,7 +3594,8 @@ menubutton.column-header-action > button:active {
   padding: 6px 9px 4px;
 }
 
-.properties-content {
+.properties-content,
+.drive-properties-content {
   min-width: 382px;
 }
 

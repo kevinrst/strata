@@ -3,7 +3,7 @@
 use crate::ui::blur::BlurBin;
 use crate::ui::browser::ViewState;
 use crate::ui::browser::entry::{format_file_size, item_count_label};
-use crate::ui::controls::modal_layout;
+use crate::ui::controls::{modal_layout, progress_summary};
 use crate::ui::modal::{ModalHost, dismiss_modal_layer, modal_layer};
 use gtk::glib;
 use gtk::prelude::*;
@@ -207,9 +207,8 @@ impl ViewState {
         let status = gtk::Label::new(Some("0%"));
         status.add_css_class("modal-progress-status");
         status.set_xalign(0.0);
-        let progress = gtk::ProgressBar::new();
-        progress.add_css_class("modal-progress");
-        progress.set_fraction(0.0);
+        let summary = progress_summary("Transferred");
+        let progress = summary.progress;
         let archive_activity = gtk::Spinner::new();
         archive_activity.set_visible(false);
         let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -217,25 +216,11 @@ impl ViewState {
         status_row.append(&status);
         layout.body.append(&status_row);
 
-        let transfer_header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        transfer_header.add_css_class("transfer-progress-header");
+        let transfer_header = summary.header;
         transfer_header.set_visible(false);
-        let transfer_amount = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        transfer_amount.set_hexpand(true);
-        let caption = gtk::Label::new(Some("Transferred"));
-        caption.add_css_class("transfer-progress-caption");
-        caption.set_xalign(0.0);
-        let transfer_bytes = gtk::Label::new(None);
-        transfer_bytes.add_css_class("transfer-progress-bytes");
-        transfer_bytes.set_xalign(0.0);
-        transfer_amount.append(&caption);
-        transfer_amount.append(&transfer_bytes);
-        let transfer_percent = gtk::Label::new(None);
-        transfer_percent.add_css_class("transfer-progress-percent");
-        transfer_header.append(&transfer_amount);
-        transfer_header.append(&transfer_percent);
-        layout.body.append(&transfer_header);
-        layout.body.append(&progress);
+        let transfer_bytes = summary.amount;
+        let transfer_percent = summary.percent;
+        layout.body.append(&summary.widget);
 
         let transfer_footer = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         transfer_footer.add_css_class("transfer-progress-footer");

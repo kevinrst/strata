@@ -14,6 +14,7 @@ pub(crate) mod model_preview;
 mod native_fs;
 mod navigation_history;
 mod operations;
+pub(crate) mod package_manager;
 mod preview;
 mod release_channel;
 pub(crate) mod rtf;

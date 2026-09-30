@@ -2581,7 +2581,7 @@ impl PreviewState {
         box_.append(&heading);
         box_.append(&detail);
         if let Some(command) = command {
-            box_.append(&copyable_command(command));
+            box_.append(&super::controls::copyable_command(command));
         }
         self.content.append(&box_);
     }
@@ -2947,53 +2947,6 @@ pub(super) fn document_notice(message: &str) -> gtk::Label {
     notice.set_wrap(true);
     notice.set_xalign(0.0);
     notice
-}
-
-fn copyable_command(command: &str) -> gtk::Overlay {
-    let overlay = gtk::Overlay::new();
-    overlay.add_css_class("preview-command");
-    overlay.set_hexpand(true);
-
-    let field = gtk::Entry::new();
-    field.add_css_class("form-control");
-    field.add_css_class("preview-command-entry");
-    field.set_text(command);
-    field.set_editable(false);
-    field.set_hexpand(true);
-    overlay.set_child(Some(&field));
-
-    let copy = gtk::Button::builder()
-        .tooltip_text("Copy install command")
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Center)
-        .build();
-    copy.add_css_class("preview-command-copy");
-    copy.set_has_frame(false);
-    copy.set_cursor_from_name(Some("pointer"));
-    let copy_icon = crate::assets::primary_icon(crate::assets::icons::COPY, 16);
-    copy.set_child(Some(&copy_icon));
-    let copied_command = command.to_owned();
-    let feedback_generation = Rc::new(Cell::new(0_u64));
-    copy.connect_clicked(move |button| {
-        if let Some(display) = gtk::gdk::Display::default() {
-            display.clipboard().set_text(&copied_command);
-        }
-        let generation = feedback_generation.get().saturating_add(1);
-        feedback_generation.set(generation);
-        crate::assets::set_primary_icon(&copy_icon, crate::assets::icons::CHECK);
-        button.set_tooltip_text(Some("Install command copied"));
-        let button = button.clone();
-        let copy_icon = copy_icon.clone();
-        let feedback_generation = feedback_generation.clone();
-        glib::timeout_add_local_once(Duration::from_secs(2), move || {
-            if feedback_generation.get() == generation {
-                crate::assets::set_primary_icon(&copy_icon, crate::assets::icons::COPY);
-                button.set_tooltip_text(Some("Copy install command"));
-            }
-        });
-    });
-    overlay.add_overlay(&copy);
-    overlay
 }
 
 fn media_error_feedback(message: &str) -> (&'static str, String, Option<&'static str>) {

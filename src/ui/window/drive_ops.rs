@@ -29,14 +29,6 @@ impl FilesystemType {
         }
     }
 
-    pub(super) fn description(self) -> &'static str {
-        match self {
-            Self::Fat32 => "Wide compatibility; 4 GB file size limit",
-            Self::Ntfs => "Windows native; no practical file size limit",
-            Self::Exfat => "Modern cross-platform; no 4 GB limit",
-        }
-    }
-
     pub(super) fn max_label_len(self) -> usize {
         match self {
             Self::Fat32 => 11,
@@ -96,11 +88,19 @@ impl FilesystemType {
         self.mkfs_candidates().iter().find_map(|cmd| tool_path(cmd))
     }
 
-    fn label_cmd(self) -> &'static str {
+    pub(super) fn label_cmd(self) -> &'static str {
         match self {
             Self::Fat32 => "fatlabel",
             Self::Ntfs => "ntfslabel",
             Self::Exfat => "exfatlabel",
+        }
+    }
+
+    pub(super) fn format_tool_name(self) -> &'static str {
+        match self {
+            Self::Fat32 => "mkfs.fat",
+            Self::Ntfs => "mkfs.ntfs or mkntfs",
+            Self::Exfat => "mkfs.exfat",
         }
     }
 
@@ -356,13 +356,13 @@ pub(super) async fn format_volume(
     label: String,
     quick: bool,
 ) -> Result<(), DriveOpError> {
+    let cmd = fs_type
+        .resolve_mkfs()
+        .ok_or_else(|| DriveOpError::ToolNotFound("mkfs".to_owned()))?;
     let device = unmount_for_exclusive_access(&parent, &volume).await?;
     let device_arg = device.to_string_lossy().into_owned();
     let mut args = fs_type.format_args(&label, quick);
     args.push(device_arg);
-    let cmd = fs_type
-        .resolve_mkfs()
-        .ok_or_else(|| DriveOpError::ToolNotFound("mkfs".to_owned()))?;
     let cmd_display = cmd.display().to_string();
     gio::spawn_blocking(move || run_privileged_tool(&cmd_display, &args).map(|_| ()))
         .await
@@ -382,7 +382,7 @@ pub(super) async fn rename_volume(
             "The label cannot be empty".to_owned(),
         ));
     }
-    let device = unmount_for_exclusive_access(&parent, &volume).await?;
+    let device = block_device_for_volume(&volume).ok_or(DriveOpError::DeviceNotFound)?;
     let fs_type = gio::spawn_blocking({
         let device = device.clone();
         move || filesystem_of_device(&device)
@@ -396,11 +396,9 @@ pub(super) async fn rename_volume(
             fs_type.max_label_len()
         )));
     }
-    if !fs_type.label_tool_available() {
-        return Err(DriveOpError::ToolNotFound(fs_type.label_cmd().to_owned()));
-    }
     let cmd = tool_path(fs_type.label_cmd())
         .ok_or_else(|| DriveOpError::ToolNotFound(fs_type.label_cmd().to_owned()))?;
+    let device = unmount_for_exclusive_access(&parent, &volume).await?;
     let cmd_display = cmd.display().to_string();
     let args = vec![device.to_string_lossy().into_owned(), trimmed.to_owned()];
     gio::spawn_blocking(move || run_privileged_tool(&cmd_display, &args).map(|_| ()))

@@ -23,6 +23,7 @@ mod jobs;
 mod loading_skeleton;
 mod marquee;
 mod media;
+mod missing_tools;
 mod modal;
 mod motion;
 mod open_with;

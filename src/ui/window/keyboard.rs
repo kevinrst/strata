@@ -723,6 +723,12 @@ impl Dispatcher {
     }
 
     fn tenxer_sidebar(&self, browser: &Browser, key: Key, modifiers: Modifiers) -> KeyResult {
+        if super::is_context_menu_shortcut(key, modifiers)
+            && sidebar::open_sidebar_context_menu(&self.sidebar.widget)
+        {
+            self.shortcuts.cancel_chord();
+            return Some(Propagation::Stop);
+        }
         let chord = sidebar_chord(key, modifiers)?;
         match chord {
             SidebarChord::Move(delta) => {

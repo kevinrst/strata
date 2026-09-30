@@ -73,6 +73,87 @@ impl FileSource for InertUris {
     }
 }
 
+#[test]
+fn tenxer_go_works_after_dialog_close_and_chained_confirmation() {
+    crate::test_support::gtk_test(
+        "ui::window::tests::keyboard_dispatch::go_prompt::tenxer_go_works_after_dialog_close_and_chained_confirmation",
+        || {
+            let fixture = KeyboardFixture::new();
+            enable_tenxer(&fixture);
+            install_modal_focus_trap(&fixture.window);
+            let row = sidebar_button(crate::assets::icons::HARD_DRIVE, "Drive");
+            fixture.sidebar.state.places_for_test().append(&row);
+            let action = gtk::Button::with_label("Open drive dialog");
+            let popover = gtk::Popover::builder()
+                .child(&action)
+                .has_arrow(false)
+                .build();
+            popover.add_css_class("folder-context-popover");
+            popover.set_parent(&row);
+            let opened = Rc::new(RefCell::new(None));
+            let entry_focus = Rc::new(Cell::new(false));
+            let requested_entry = entry_focus.clone();
+            let dialog = opened.clone();
+            let view = fixture.view.clone();
+            let menu = popover.downgrade();
+            action.connect_clicked(move |_| {
+                super::super::super::drive_dialogs::open_from_sidebar(
+                    &view,
+                    menu.upgrade().as_ref(),
+                    || {
+                        dialog.replace(Some(
+                            super::super::super::drive_dialogs::tests::focus_dialog_fixture(
+                                &view.widget(),
+                                requested_entry.get(),
+                            ),
+                        ));
+                    },
+                );
+            });
+            for mode in [BrowserMode::List, BrowserMode::Icons, BrowserMode::Columns] {
+                fixture.view.set_view_mode(mode);
+                for (with_entry, chained) in [(false, false), (true, false), (true, true)] {
+                    entry_focus.set(with_entry);
+                    row.grab_focus();
+                    assert!(fixture.press(Key::F10, ModifierType::SHIFT_MASK));
+                    wait_until(|| popover.is_visible());
+                    action.grab_focus();
+                    action.emit_clicked();
+                    let (first, close) = opened.borrow_mut().take().expect("drive dialog");
+                    let (last, close) = if chained {
+                        let next = super::super::super::drive_dialogs::tests::focus_dialog_fixture(
+                            &fixture.view.widget(),
+                            false,
+                        );
+                        close.emit_clicked();
+                        wait_until(|| first.parent().is_none());
+                        assert!(!fixture.view.item_view_has_focus());
+                        fixture.view.set_view_mode(if mode == BrowserMode::Columns {
+                            BrowserMode::List
+                        } else {
+                            BrowserMode::Columns
+                        });
+                        next
+                    } else {
+                        (first, close)
+                    };
+                    close.emit_clicked();
+                    wait_until(|| last.parent().is_none());
+                    assert!(
+                        fixture.view.item_view_has_focus(),
+                        "{mode:?}, entry={with_entry}, chained={chained}"
+                    );
+                    assert!(fixture.press(Key::g, ModifierType::empty()));
+                    assert!(fixture.press(Key::space, ModifierType::empty()));
+                    assert_eq!(fixture.shortcuts.open_prompt_kind(), Some(Prompt::Go));
+                    assert!(fixture.shortcuts.prompt_has_focus());
+                    assert!(fixture.press(Key::Escape, ModifierType::empty()));
+                }
+            }
+        },
+    );
+}
+
 fn fixture_with(folders: Rc<dyn crate::ui::go_completion::FolderSource>) -> KeyboardFixture {
     KeyboardFixture::with_parts(Rc::new(TextPreview), folders, browser_for_window)
 }
