@@ -39,7 +39,7 @@ pub(crate) use document::{
     has_web_scheme, layout_document, parse_document, parse_markdown,
 };
 pub use file_source::{
-    DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
+    DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle, LocationIdentity,
     LocationValidationError, MetadataOutcome, MetadataRequest, MetadataUpdate, RequestId,
     UriCredentials, backend_unavailable_message, sanitize_uri_credentials,
     validate_uri_credentials,
@@ -97,7 +97,10 @@ pub(crate) use release_channel::{BuildKind, Channel, Version};
 pub(crate) use remote_download::{
     RemoteDownload, download_remote, prune_stale_downloads, remote_file_name, remote_file_url,
 };
-pub(crate) use search::{RESULT_LIMIT as SEARCH_RESULT_LIMIT, refresh_search_indexes_for_rename};
+pub(crate) use search::{
+    RESULT_LIMIT as SEARCH_RESULT_LIMIT, RenameScope, rebase_search_indexes,
+    refresh_search_indexes_for_directory, refresh_search_indexes_for_rename,
+};
 pub(crate) use search::{
     RefusedFolders, SearchCoverage, SearchEvent, SearchExclusions, SearchHandle, SearchItem,
     filter_name_matches, filter_query_allows_typos, fold_for_search, index_filter,

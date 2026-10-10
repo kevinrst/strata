@@ -695,7 +695,17 @@ pub(super) fn vim_focus_direction(key: gtk::gdk::Key) -> Option<gtk::DirectionTy
 }
 
 pub(super) fn visible_modal_layer(window: &impl IsA<gtk::Window>) -> Option<gtk::Widget> {
-    fn visible_layer(root: &gtk::Widget) -> Option<gtk::Widget> {
+    topmost_modal_layer(window, &|_| false)
+}
+
+fn topmost_modal_layer(
+    window: &impl IsA<gtk::Window>,
+    skip: &dyn Fn(&gtk::Widget) -> bool,
+) -> Option<gtk::Widget> {
+    fn visible_layer(
+        root: &gtk::Widget,
+        skip: &dyn Fn(&gtk::Widget) -> bool,
+    ) -> Option<gtk::Widget> {
         if !root.is_visible()
             || !root.is_child_visible()
             || root.opacity() == 0.0
@@ -704,7 +714,7 @@ pub(super) fn visible_modal_layer(window: &impl IsA<gtk::Window>) -> Option<gtk:
             return None;
         }
         if root.has_css_class("app-modal-layer") {
-            return Some(root.clone());
+            return (!skip(root)).then(|| root.clone());
         }
         let mut child = root.last_child();
         while let Some(widget) = child {
@@ -712,7 +722,7 @@ pub(super) fn visible_modal_layer(window: &impl IsA<gtk::Window>) -> Option<gtk:
             if root.has_css_class("tab-context") && !widget.has_css_class("app-modal-layer") {
                 continue;
             }
-            if let Some(layer) = visible_layer(&widget) {
+            if let Some(layer) = visible_layer(&widget, skip) {
                 return Some(layer);
             }
         }
@@ -720,17 +730,28 @@ pub(super) fn visible_modal_layer(window: &impl IsA<gtk::Window>) -> Option<gtk:
     }
     let root = window.child()?;
     if root.has_css_class("tab-window") {
-        visible_layer(&root)
+        visible_layer(&root, skip)
     } else {
         let mut child = root.last_child();
         while let Some(widget) = child {
             child = widget.prev_sibling();
-            if widget.is_visible() && widget.has_css_class("app-modal-layer") {
+            if widget.is_visible() && widget.has_css_class("app-modal-layer") && !skip(&widget) {
                 return Some(widget);
             }
         }
         None
     }
+}
+
+/// True when the topmost visible modal layer is not `own`. An action that opens a
+/// modal passes its own layer so it can still toggle that layer closed. A layer that
+/// is animating out no longer owns input.
+pub(super) fn foreign_modal_visible(
+    window: &impl IsA<gtk::Window>,
+    own: Option<&gtk::Widget>,
+) -> bool {
+    topmost_modal_layer(window, &crate::ui::modal::is_closing_layer)
+        .is_some_and(|layer| own != Some(&layer))
 }
 
 pub(super) fn install_modal_focus_trap(window: &impl IsA<gtk::Window>) {
@@ -795,18 +816,21 @@ pub(super) fn build_appearance_menu(
         "Columns",
         current_mode == BrowserMode::Columns,
         true,
+        gtk::AccessibleRole::MenuItemRadio,
     );
     let (icons, icons_check, _) = appearance_option(
         crate::assets::icons::ICONS,
         "Icons",
         current_mode == BrowserMode::Icons,
         true,
+        gtk::AccessibleRole::MenuItemRadio,
     );
     let (list, list_check, _) = appearance_option(
         crate::assets::icons::LIST,
         "List",
         current_mode == BrowserMode::List,
         true,
+        gtk::AccessibleRole::MenuItemRadio,
     );
     let grouped = preferences.group_by_type();
     let (group_by_type, group_check, _) = appearance_option(
@@ -814,6 +838,7 @@ pub(super) fn build_appearance_menu(
         "Group by file type",
         grouped,
         current_mode.supports_type_grouping(),
+        gtk::AccessibleRole::MenuItemCheckbox,
     );
     crate::ui::accessibility::set_description(
         &group_by_type,
@@ -949,12 +974,14 @@ pub(super) fn build_appearance_menu(
         "Compact",
         current_density == BrowserDensity::Compact,
         true,
+        gtk::AccessibleRole::MenuItemRadio,
     );
     let (airy, airy_check, _) = appearance_option(
         crate::assets::icons::ROWS,
         "Airy",
         current_density == BrowserDensity::Airy,
         true,
+        gtk::AccessibleRole::MenuItemRadio,
     );
     preferences.bind_preference(
         &compact_check,
@@ -1029,6 +1056,7 @@ pub(super) fn build_appearance_menu(
         "Ctrl + H",
         hidden_files_shown,
         true,
+        gtk::AccessibleRole::MenuItemCheckbox,
     );
     let observed_hidden_check = hidden_check.clone();
     let observed_hidden_icon = hidden_icon.clone();
@@ -1093,8 +1121,9 @@ fn appearance_option(
     label: &str,
     checked: bool,
     sensitive: bool,
+    role: gtk::AccessibleRole,
 ) -> (gtk::Button, gtk::Image, gtk::Image) {
-    appearance_option_with_shortcut(icon, label, "", checked, sensitive)
+    appearance_option_with_shortcut(icon, label, "", checked, sensitive, role)
 }
 
 fn appearance_option_with_shortcut(
@@ -1103,14 +1132,23 @@ fn appearance_option_with_shortcut(
     shortcut: &str,
     checked: bool,
     sensitive: bool,
+    role: gtk::AccessibleRole,
 ) -> (gtk::Button, gtk::Image, gtk::Image) {
     let (row, check, option) = appearance_row(icon, label, shortcut, checked);
     let button = gtk::Button::builder()
         .child(&row)
         .sensitive(sensitive)
+        .accessible_role(role)
         .build();
     button.add_css_class("appearance-option");
     button.set_has_frame(false);
+    let name = crate::i18n::tr(label);
+    if shortcut.is_empty() {
+        super::accessibility::set_label(&button, &name);
+    } else {
+        super::accessibility::describe_menu_item(&button, &name, shortcut);
+    }
+    super::accessibility::sync_checked_with_icon(&button, &check);
     (button, check, option)
 }
 
@@ -1810,7 +1848,7 @@ impl SidebarState {
             Err(error) => show_error_dialog(
                 &self.view.widget(),
                 &crate::i18n::tr("Unable to update pinned folders"),
-                &error.to_string(),
+                &crate::services::io_error_message(&error),
             ),
         }
     }
@@ -4142,7 +4180,7 @@ fn save_pinned_places(places: &[(Location, String)]) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let contents = serialize_pinned_places(places);
-    crate::storage::atomic_write(&path, contents.as_bytes())
+    crate::storage::atomic_write_config(&path, contents.as_bytes())
 }
 
 fn serialize_pinned_places(places: &[(Location, String)]) -> String {

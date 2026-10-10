@@ -4,6 +4,12 @@ Application-wide preferences live in `ui::preferences::Preferences`. The
 `ui::preferences::PreferenceManager` loads them once per application process and
 persists changes atomically to
 `$XDG_CONFIG_HOME/strata/settings.toml` (normally `~/.config/strata/settings.toml`).
+The file may be a symlink, for example into a dotfiles repository: Strata follows
+up to eight links owned by the current user to a regular file the user owns,
+replaces that target atomically in its own directory, keeps its permission bits
+and leaves the links in place. Links owned by another user, links to directories
+or missing targets, and longer chains are refused. A missing file is created
+with owner-only permissions; an existing one keeps its permission bits.
 It owns the serialized schema, change notifications, and widget bindings for every
 settings consumer, theme-related or not. `ui::theme::ThemeManager` separately owns
 the theme catalog, shared CSS application, custom themes, and Omarchy following;
@@ -22,7 +28,13 @@ settings in `settings/search.rs`; `settings_option` tags ordinary rows, while
 custom sections use `search::tag`. Keep installation-specific availability
 separate with `search::set_available`, so clearing a query cannot reveal an
 unsupported release-channel selector. Lazy pages apply the latest query when
-they finish loading.
+they finish loading. Give each new target a `settings_keywords.<id>` entry in
+every catalog (see [Internationalization](internationalization.md)). Search
+routes to pages through the `NAVIGATION` table in `settings.rs`.
+`ui::settings::search::tests::every_page_row_is_registered_for_search` builds
+every page and fails on a row or section without a target. Register the row, or
+tag status-only content with its section's target (the managed-install row uses
+"Check for updates"), rather than exempting it.
 
 ## One initialization and update path
 
@@ -33,11 +45,21 @@ current value immediately, then applies only
 changes to its selected value. There is no separate startup initializer to keep
 in sync with the change handler. Every setter goes through `save_preferences`,
 which deduplicates unchanged preferences and publishes changes through the same
-notification mechanism. Failed writes are logged, still apply in memory, and
-are retried on the next save attempt. If an existing settings file cannot be read
+notification mechanism. Failed writes are logged with the path and reason, still
+apply in memory, and are retried on the next save, so a transient failure such as
+a full disk recovers once its cause is fixed. The first failure also opens a
+"Settings can't be saved" dialog with the path and reason, saying that changes
+last only until Strata closes. It appears once per failure streak, in the active
+browser window where the change was made, and again only after a save has
+succeeded and then failed. A failure while no browser window is active, such as
+a background Omarchy theme update, is only logged and leaves the notice for the
+next failure. If an existing settings file cannot be read
 or parsed as TOML, startup logs a warning and uses temporary defaults. Preference
 changes still apply in memory, but saving is disabled for that manager's lifetime
-to preserve the original file. Fix the file and restart Strata to resume saving.
+to preserve the original file. The first change made in a browser window then
+opens a "Settings file can't be read" dialog instead, once. Fix the file and restart
+Strata to resume saving. Portal file choosers never show these dialogs; their
+failures are only logged.
 Missing files allow normal first-run saves; invalid values in otherwise valid
 TOML still use the existing per-entry recovery.
 
@@ -58,7 +80,7 @@ control that might be midway through synchronization.
 | Stored preferences | Consumer / application point |
 | --- | --- |
 | Default directory | New windows without an explicit target read the current choice before navigating, without opening Settings. Existing windows and explicit targets are unchanged. Missing directories fall back to home and clear the saved choice; Reset also restores home. |
-| Folder peeking, single-click previews, columns selection mirror, mode, density, grouping, per-mode click counts, auto-refresh | Every browser binds at construction, including lazily rebuilt view modes. Miller columns disallow folder-peek popovers regardless of the saved value; Icons and List retain the preference. The chooser explicitly disallows folder peeking and the columns selection mirror regardless of the saved values. |
+| Folder peeking, single-click previews, columns selection mirror, mode, density, grouping, per-mode click counts, auto-refresh | Every browser binds at construction, including lazily rebuilt view modes. Miller columns disallow folder-peek popovers regardless of the saved value; Icons and List retain the preference. The chooser explicitly disallows folder peeking and the columns selection mirror regardless of the saved values. Auto-refresh accepts only the Settings choices (Off, 1, 5 or 10 min); an unlisted saved interval is rounded up to the next choice (capped at 10 min) when loaded or set, and the repaired value is written on the next save. |
 | Hidden files | Shared across existing browsers and new columns. |
 | Open folder after dropping files | Drop dispatch reads the saved choice (off by default), including confirmation of cross-device drops. Successful drops reveal the destination only when enabled and the user is still at the transfer origin. Paste and Move/Copy to remain unchanged. |
 | Cross-device drag and drop | Drop dispatch reads the current Copy, Move, or Ask strategy; unresolved volume lookups follow the same cross-device policy. |
@@ -74,19 +96,19 @@ control that might be midway through synchronization.
 | Interface renderer | GTK selects the renderer at process startup. The saved GTK default or Cairo choice is read before GTK initializes; GTK default is selected for new installs. The control and Restart button synchronize across Settings windows, but changes take effect only after restarting Strata (via the button or after fully quitting and reopening). An explicit `GSK_RENDERER` always overrides the saved choice. |
 | Keybinding hints | Navigation hints and the shortcuts button bind immediately and live. When hidden, the status bar appears only while the clipboard badge or F1 reference needs it; otherwise the empty bar is hidden. |
 | Thumbnail workers | Browser construction binds the shared decoder limit before Settings opens. Changes apply across windows and rebuilt views; lowering the limit lets active work finish and retires excess idle supervisors. |
-| Browser and chooser column widths | A Columns resize or a List heading resize, including double-click autofit, saves the unscaled width. New columns and rebuilt List panes read the latest saved defaults before Settings opens. Existing panes retain their own widths; resizing one window does not resize another. Browser defaults (`browser_column_width`, `browser_list_columns`) and chooser defaults (`chooser_column_width`, `chooser_list_columns`) are independent. The Name column keeps expanding until it is resized itself. Not exposed in Settings. |
+| Browser and chooser column widths | A Columns resize or a List heading resize, including double-click autofit, saves the unscaled width. New columns and rebuilt List panes read the latest saved defaults before Settings opens. Dragging a Columns edge resizes that column as the pointer moves, with a **Column width** caption that appears once the pointer rests on the edge and follows it through the drag, and when the drag ends the window's other open columns ease to the same width; double-click autofit changes only its own column. Other windows keep their widths. Browser defaults (`browser_column_width`, `browser_list_columns`) and chooser defaults (`chooser_column_width`, `chooser_list_columns`) are independent. The Name column keeps expanding until it is resized itself. Not exposed in Settings. |
 | Icons view thumbnail size | Every browser binds at construction, before the browser mode preference applies, so an Icons pane built at startup already uses the saved size. The popover slider's own live change persists it; other windows' visible Icons panes move their slider (and resize) to match. Clamped to 32–256 px; not exposed in Settings. |
 | Hardware video acceleration/backend | Preview providers read the current choice when requesting a preview; changing it does not restart an already playing file. Settings controls and backend availability synchronize live. |
 | Preview text wrap | Every text preview and header toggle binds to the saved wrap choice, including newly loaded files. Off by default. |
 | Preview autoplay | Read when a video, audio, or GIF preview is first shown. Off by default: playback waits for an explicit play action; the generic player shows its center play affordance, and the audio and video views their transport play button. When on, playback starts silent and fades in on a slow-in, slow-out curve, over 1 s from the first frame for video and over 0.5 s from the first sample for audio, unless the saved audio state is muted or the file is shorter than 10 s, which plays at full volume at once; any play, pause, seek, volume or mute input brings the sound in at once, and the saved volume is never changed. Continuing playback into the next file with `<` / `>` keeps its sound. Does not affect resuming playback that was already active before a preview pane was temporarily hidden by a resize. |
 | Render documents by default | A newly loaded Markdown or HTML preview reads the current choice for its initial Rendered or Source view. Switching the view of an open document does not change the saved default. |
 | Preview mute/volume | Every player's controls and media stream bind to the saved audio state. Slider changes publish/persist together, without a delayed stale save overwriting another window or being discarded when closing a preview. |
-| Automatic updates, release channel | Eligibility checks read current preferences. Controls synchronize, and all windows clear outdated notices when these preferences change, even without opening Settings. A package-managed installation's tracked channel is enforced when read, not by constructing Settings. |
+| Automatic updates, release channel | Eligibility checks read current preferences. Controls synchronize, and all windows clear outdated notices when these preferences change, even without opening Settings. A package-managed installation's tracked channel is enforced when read, not by constructing Settings. On by default. The switch controls the automatic check, which runs at every start once the first window paints and again when a window or **Settings → Updates** opens if no check has completed in the last 24 hours. Turning it off also locks the channel, hides shown update notices, and discards an in-flight check's result; turning it back on or changing the channel checks immediately. **Check now** and the release-notes card (fetched when the Updates page opens, unless cached) ignore the switch. |
 | Sidebar order | Existing sidebars bind to the shared order. |
 | Sidebar default-place visibility | Existing sidebars bind to the shared Home, Trash, Network, Recent, and standard-folder visibility (Desktop, Documents, Downloads, Music, Pictures, and Videos) and rebuild. Enabled by default; hiding removes that place from the sidebar without changing pins or devices. Recent is also omitted when GTK recent-file tracking or the runtime Recent VFS backend is unavailable, and from local-only sidebars. Toggle the location chips under General → Sidebar; existing default-place Unpin context actions remain available where supported. Re-enable a hidden place’s chip to restore it. |
 | Sidebar expanded | Browser windows bind their header toggle at construction: a saved collapsed state starts closed without animation, and `Ctrl+B` or the header toggle persists the choice and updates all open browser windows live. Expanded by default; not exposed in Settings. The portal chooser keeps its own unsaved sidebar state. |
 | Modified date format | Modified-time labels read the saved format at every render; already-open labels re-render live. Properties uses full absolute local timestamps for Relative, while preserving ISO 8601 and Long. |
-| Folder colors/custom icons | Icon resolution reads the manager; existing customization refreshes notify rendered icons, including local sidebar folders, customization previews, and Properties. Sidebar folder icons retain their customization in collapsed mode and across row rebuilds. Local sidebar folders expose the shared Customize action. |
+| Folder colors/custom icons | Icon resolution reads the manager; existing customization refreshes notify rendered icons, including local sidebar folders, customization previews, and Properties. Sidebar folder icons retain their customization in collapsed mode and across row rebuilds. Local sidebar folders expose the shared Customize action. Entries are keyed by absolute local path, and file operations performed in Strata update them item by item as each item lands, saving once the burst of changes settles. Renames, moves, and their undo/redo carry the item's entries and those of everything under it to the real destination (including a Keep both name), even when a later operation superseded the one that moved them, or a failure or cancel stopped it partway. A move to a remote location drops them. Replace, for a move or a copy, takes the replaced item's entries at and under the destination with it to Trash; a moved item then brings its own. Merge keeps the destination folder's own entry; a merged move carries the merged folder's descendants over same-named destination entries and drops the entries of destination files it overwrote, while a merged copy leaves destination entries alone. Trash removes the entries from `settings.toml` and keeps them in memory for the session, at most 10,000 entries (the oldest go first). Put back or undo re-applies them only to the same item, recognised by its device and inode, at exactly the path it was trashed from; another item that left that path stays plain. Permanent delete removes them. Copies, including duplicates, start uncustomized, and a new item at a path whose item Strata moved or removed starts plain; entries left behind by changes outside Strata, or by an uncustomized item replacing another where Trash is unsupported, still apply to whatever appears at that path. Changes made outside Strata (shell commands, other applications, batch-rename actions, or an open folder renamed underneath a window) are not followed, nor are items that land after the operation's window closed, entries for missing paths are not pruned at startup, so unmounted volumes keep theirs, and a FAT-family destination that renames a moved folder's descendants leaves their entries at names that cannot exist there. |
 | Device display labels | `device_labels` stores Strata-only labels by filesystem UUID, with mount URI fallback when a UUID is unavailable. Sidebar device rows and Properties bind at construction, update across open windows, and reapply on row rebuilds. Set label… edits the label; blank restores the system-provided name. Filesystem labels, mount/boot configuration, and other applications remain unchanged. Label editors retain their local draft while their Save action follows the latest shared value. Send-to menus and destructive Format confirmations retain system-provided drive names. No Settings page is required. |
 | Recent Send-to destinations | `send_to_recent_destinations` stores up to three relative directory paths per stable removable-device ID. The selection menu validates them against the device's current canonical root when opened and again when activated; no Settings control is exposed. |
 | Restore open tabs | Plain launches reopen the previous tabs in strip order with the previously active tab selected, when the Startup toggle is on (the default). Explicit folder arguments, reveal requests, and unlock flows bypass restore. Toggle it under General → Startup; the toggle binds live across Settings windows. |
@@ -282,6 +304,10 @@ on by default. Turn it off to match only immediate files and folders, without
 redundant path subtitles. The choice applies to pane filtering in Columns, Icons,
 and List views, not global search.
 Changing it refreshes active filters across windows and is saved for next launch.
+With it on, changes that other programs make in subfolders of the watched folders
+reach active filters on F5, Auto-refresh, or when the filter is opened again; changes
+in a watched folder show within about a second (see
+[Filename patterns while filtering](keyboard-navigation.md#filename-patterns-while-filtering)).
 [10xer mode](10xer-mode.md) does not use it: there **f** filters only the
 current folder and **s** always searches below it.
 
@@ -336,6 +362,6 @@ and Icons. See
    Test both directions; a test that only saves and deserializes is insufficient.
 
 The regression suites also check no writes from opening Settings, no duplicate
-notifications, reentrant changes, listener cleanup, failed-write retries,
-chooser overrides, type-to-search keyboard behavior, and synchronized media
-controls. Run GTK tests on the private display described in `e2e-testing.md`.
+notifications, reentrant changes, listener cleanup, failed-write retries and
+notices, symlinked settings files, chooser overrides, type-to-search keyboard
+behavior, and synchronized media controls. Run GTK tests on the private display described in `e2e-testing.md`.

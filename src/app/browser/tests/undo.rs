@@ -1194,6 +1194,9 @@ fn an_empty_extraction_records_no_undo() {
 fn an_undone_trash_operation_can_be_redone() {
     let browser = Browser::new(Rc::new(FakeFileSource));
     browser.set_operation_provider(Rc::new(ImmediateOperationProvider));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    browser.observe(move |event| observed.borrow_mut().push(event.clone()));
     let location = Location::local("/fixture/report.txt");
     browser.delete(vec![fixture_entry("/fixture/report.txt")], false);
 
@@ -1212,6 +1215,14 @@ fn an_undone_trash_operation_can_be_redone() {
     assert_eq!(
         pending_undo_entry(),
         Some(UndoEntry::Trash(vec![location.clone()]))
+    );
+    assert_eq!(
+        location_changes(&events.borrow()),
+        [
+            removed(&location),
+            LocationChange::Restored(location.clone()),
+            removed(&location)
+        ]
     );
     UNDO_COPY_REQUESTS.with(|requests| {
         assert_eq!(&*requests.borrow(), &vec![vec![location]]);
@@ -1239,6 +1250,9 @@ fn a_new_operation_clears_the_redo() {
 fn an_undone_move_can_be_redone() {
     let browser = Browser::new(Rc::new(FakeFileSource));
     browser.set_operation_provider(Rc::new(ImmediateOperationProvider));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    browser.observe(move |event| observed.borrow_mut().push(event.clone()));
     browser.transfer(
         Location::local("/fixture/archive"),
         vec![PasteItem {
@@ -1290,6 +1304,15 @@ fn an_undone_move_can_be_redone() {
     assert_eq!(
         pending_undo_entry(),
         Some(UndoEntry::Move(vec![record.clone()]))
+    );
+    assert_eq!(
+        location_changes(&events.borrow()),
+        [
+            relocated(&record.original, &record.current),
+            relocated(&record.current, &record.original),
+            relocated(&record.original, &record.current),
+        ],
+        "a move, its undo and its redo each relocate the item"
     );
     UNDO_MOVE_REQUESTS.with(|requests| {
         assert_eq!(

@@ -69,23 +69,44 @@ Pressing blank column content focuses that directory, including empty directorie
 
 **Shift+Up/Down** extends the selection from the range anchor by one item, **Shift+Page Up/Page Down** by one page. After Escape clears the selection, the range starts at the cursor.
 
-Copy/cut use the selection in the focused column, never a hovered row. In Columns, Delete/Shift+Delete with no selected items does nothing: an open parent-path marker is not an implicit deletion target. The separate List/Icons parent-deletion fallback is tracked in #300. Delete in a location without Trash support, or after a Trash attempt fails because Trash is unsupported, opens the permanent-deletion confirmation with Cancel focused and the reason stated; Shift+Delete is unchanged.
+Copy/cut use the selection in the focused column, never a hovered row. In Columns, Delete/Shift+Delete with no selected items does nothing: an open parent-path marker is not an implicit deletion target. In List and Icons, Delete acts on the selection only. Delete in a location without Trash support, or after a Trash attempt fails because Trash is unsupported, opens the permanent-deletion confirmation with Cancel focused and the reason stated; Shift+Delete is unchanged.
 
 Background selection updates from directory loading must not move keyboard focus to an inactive column.
 
-## Returning to an Icons or List directory
+## Returning to a visited directory
 
 Icons and List remember the selection, keyboard cursor, and scroll position of the
-last 128 directories left in that browser. Back, Forward, and Up restore each
-visited directory after its entries load, including nested parents. Arrow-key
-navigation continues from the restored row. Entries are matched by location,
-not their previous row numbers; deleted entries are not selected accidentally.
-This is temporary browsing state, not a saved preference. New input in the file view
-cancels an in-progress restoration.
+last 128 directories left in that browser. Every route back to a visited directory
+restores it after its entries load, including nested parents: Back, Forward, Up,
+breadcrumbs, and typed paths. Arrow-key navigation continues from the restored row.
+Entries are matched by location, not their previous row numbers; deleted entries are
+not selected accidentally. The selection and cursor carry over between Icons and
+List; the exact scroll position comes back only in the view it was left in (and, for
+Icons, at the same width), otherwise the cursor is scrolled into view. This is
+temporary browsing state, not a saved preference. New input in the file view cancels
+an in-progress restoration. Back, Forward and Up move keyboard focus into the restored
+listing only when focus was inside the pane being left, its Ctrl+F field included:
+from a header button or with the sidebar focused, they restore the selection and
+leave focus where it is. Sidebar places, breadcrumbs and typed paths focus the
+listing, as on a first visit.
+
+In Columns, Back, Forward, Up and breadcrumbs that return to an ancestor of the
+current directory select the folder you came from, with the cursor on it, and leave
+its column closed. When that folder is gone or hidden, the first visible entry is
+selected instead; hidden files stay hidden. Icons and List do the same when they
+have no remembered position for the ancestor.
 
 A navigation that names a target — a typed file path, a Ctrl+K result opened with
 Enter or Alt+Enter, Open file location, or an `org.freedesktop.FileManager1`
 request — selects that target instead of restoring the remembered position.
+
+## Refreshing a directory
+
+F5, the pane's Refresh button, Auto-refresh, and the rescan after a burst of
+external changes keep the selection, the keyboard cursor and the keyboard focus in
+every view: a focused row stays focused, and a focused Ctrl+F field keeps focus and
+its text. Icons and List also keep the scroll position. When the item under the
+cursor is gone, the cursor moves to the item now in its place without selecting it.
 
 ## Creating files and folders
 
@@ -106,6 +127,8 @@ pane space), or moving keyboard focus away commits a valid name. Escape keeps
 the original name. Finishing with an empty or invalid name also keeps the
 original. Cancelling the initial rename does **not** delete the new item: it
 remains under its allocated default name. File contents are preserved.
+While a name is being edited, **F5**, **Ctrl+K**, **Ctrl+Shift+K**, **Ctrl+Alt+T**
+and **Ctrl+\\** do nothing; finish or cancel the edit first.
 
 Clicking inside the field continues editing. Existing files retain extension-aware
 selection (the stem is selected); folder names containing dots are selected in full.
@@ -142,6 +165,18 @@ Clear the input, or press Escape in the input or on a focused result, to restore
 the directory listing with focus on its cursor. **Ctrl+K** global fuzzy search is
 unchanged.
 
+Results follow the watched folders live: the open folder, and in Columns every open
+column. A matching file that another program creates or renames there appears within
+about a second, and a deleted one leaves the results as soon as the listing drops it.
+With [Include subfolders](preferences.md#filter-scope) on, changes in folders below
+those reach the results on **F5**, Auto-refresh, the rescan after a burst of external
+changes, or when the filter is cleared and opened again.
+When another program renames the open folder itself, the view follows it and a filter
+typed in that folder ends, while filters and **Ctrl+K** searches rooted above it follow
+the rename. When the open folder is deleted or moved into another folder, the view
+returns to its nearest parent that still exists, or reloads the folder if it already
+exists again; either way the filter ends. Neither adds a history entry.
+
 ## Preview while filtering
 
 In the browser and file chooser, **Down** from the Ctrl+F input focuses the selected result, or the first result if none is selected. **Up/Down** then navigate the results; **Up** from the first result returns to the input without clearing the query. **Ctrl+F** also returns to the input. With no matches, Down leaves focus in the input.
@@ -150,7 +185,7 @@ In the browser and file chooser, **Down** from the Ctrl+F input focuses the sele
 
 While the input is focused, Space types into the query if no result is selected. **Shift+Space** inserts a space there even with a result selected. Space opens a selected folder in every view without opening or loading the preview pane; unsupported files do not open a preview.
 
-With a result focused, the first **Escape** dismisses the filter even while its quick preview is open; a second Escape closes the preview. **Ctrl+1/2/3** keep focus in the filter: in the input with the caret after the query, or on the focused result. With a query typed and focus elsewhere, the results take focus once they show. Loading or refreshing the folder never moves focus out of the input or its results.
+With a result focused, the first **Escape** dismisses the filter even while its quick preview is open; a second Escape closes the preview. **Ctrl+1/2/3** keep focus in the filter: in the input with the caret after the query, or on the focused result. With a query typed and focus elsewhere, the results take focus once they show. Loading or refreshing the folder never moves focus out of the input or its results. Neither does another program changing the folder, and that also holds for the [10xer](10xer-mode.md) **f** and **s** prompts.
 
 ## Navigating an archive preview
 
@@ -219,7 +254,10 @@ shows the displayed result total in both default and 10xer mode, including
 **0 items** on a miss.
 Selecting results does not replace that total with the hidden directory's selection;
 its accessible description gives the result file/folder breakdown. Dismissing results restores the
-ordinary directory count or selection summary.
+ordinary directory count or selection summary. Until the search for a typed query
+reports back, the footer keeps describing the directory. The `filter:` / `search:`
+mark and the hit path at the footer's left end show only in 10xer mode, which
+hides the pane's filter input; the default map shows the total alone.
 
 With no selection in the ordinary listing, the footer shows the directory's item count. Selections show a folder/file breakdown, such as **1 folder, 2 files selected (64 MB)**. Sizes sum available metadata for selected files only; folder contents are not scanned or included. Missing file sizes are marked incomplete or unavailable.
 
@@ -258,7 +296,7 @@ An empty, unreadable or still-loading directory has no rows to focus, so the pan
 
 Columns reserves preview space from startup, even before a file is previewed. **Space**, **i**, and the preview's close button dismiss the content without reclaiming that space, so opening or closing a preview does not move the columns under the pointer. Switch **Appearance → Preview panel** off to explicitly reclaim it. This reservation is window-local and does not enable automatic previews on its own. In narrow windows the preview content hides, but the reserved slot keeps the remaining width beside the focused column, down to zero. The complete sizing, reservation, and dismissal rules are in [Preview panel and column layout](preview-panel-layout.md).
 
-In Columns, the pane to the right mirrors keyboard selection like Finder: moving with **Up/Down**, **Page Up/Page Down**, **Home/End** or **Ctrl+Up/Ctrl+Down** onto a folder shows its contents in a child column that takes the reserved preview space, onto a previewable file closes that child column and opens Quick Preview in the same space, and onto any other file closes the child pane. The focused column stays where it is throughout. Shift-extended ranges do not mirror. A preview closed with **Space**, **i**, **Esc**, the close button, or **Appearance → Preview panel** stays closed while mirroring until it is opened explicitly again. Pointer selection keeps the configured click behavior. **Settings → General → Browsing → Mirror columns selection** (on by default) toggles the mirroring. 10xer mode follows the same preference for its cursor in Columns; see [10xer mode](10xer-mode.md). **l** / **→** enters a directory or a file preview, and **i** toggles a file's preview or opens the next column / toggles folder peek for a directory.
+In Columns, the pane to the right mirrors keyboard selection like Finder: moving with **Up/Down**, **Page Up/Page Down**, **Home/End** or **Ctrl+Up/Ctrl+Down** onto a folder shows its contents in a child column that takes the reserved preview space, onto a previewable file closes that child column and opens Quick Preview in the same space, and onto any other file closes the child pane. The focused column stays where it is throughout. Shift-extended ranges do not mirror. A preview closed with **Space**, **i**, **Esc**, the close button, or **Appearance → Preview panel** stays closed while mirroring until it is opened explicitly again. Pointer selection keeps the configured click behavior. Clicking a folder whose column is already open focuses that column rather than closing it, and a double-click ends exactly where a single-click open does; a slow click on a selected folder's name still renames it. **Settings → General → Browsing → Mirror columns selection** (on by default) toggles the mirroring. 10xer mode follows the same preference for its cursor in Columns; see [10xer mode](10xer-mode.md). **l** / **→** enters a directory or a file preview, and **i** toggles a file's preview or opens the next column / toggles folder peek for a directory.
 
 ## Closing dialogs and overlays
 
@@ -278,6 +316,10 @@ had focus when Settings opened, for example with **Ctrl+,**: it gets focus back.
 
 Customize opens with focus on **Done**, so one **Escape** closes it. Closing its
 custom color dialog returns focus to the custom color button.
+
+While a dialog or Settings is open, **Ctrl+K**, **Ctrl+Shift+K**, **F5**,
+**Ctrl+Alt+T** and **Ctrl+\\** do nothing and the dialog keeps focus. **Ctrl+K** and
+**Ctrl+Shift+K** still close the search palette they opened.
 
 ## Opening and navigating the context menu
 
