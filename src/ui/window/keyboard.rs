@@ -784,6 +784,14 @@ impl Dispatcher {
             }
             return Some(self.prompt_key(browser, key, modifiers));
         }
+        if self.preview.handle_find_key(
+            key,
+            modifiers,
+            self.type_to_search.preferences.tenxer_mode(),
+        ) {
+            self.shortcuts.cancel_chord();
+            return Some(Propagation::Stop);
+        }
         if let Some(result) = self.tenxer_preview_text(browser, key, modifiers) {
             return Some(result);
         }
